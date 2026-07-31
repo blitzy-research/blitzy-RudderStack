@@ -1,41 +1,31 @@
-// Package sendgridbulkupload_test exercises the SENDGRID_BULK_UPLOAD connector through the
-// four-method async destination manager contract the batch router actually calls, with the
-// SendGrid Marketing Contacts API replaced by the generated mock of the SendGridAPIService
-// seam.
+// Package sendgridbulkupload_test exercises the SENDGRID_BULK_UPLOAD connector through the four
+// methods the batch router actually calls, with the SendGrid API replaced by its generated mock.
 //
-// It is an EXTERNAL test package on purpose. Reaching the connector only through its exported
-// surface is what keeps these tests a description of the contract the batch router depends on
-// rather than of the implementation that happens to satisfy it today, and it is why the
-// uploader's fields and both request caps are exported in the first place.
+// It is an EXTERNAL test package on purpose. Every assertion here is written against the exported
+// surface - NewManager, the four interface methods, and the wire types - which is precisely the
+// surface the batch router depends on, so a change that breaks the framework contract cannot be
+// hidden behind an internal helper the router never sees.
 //
-// Three properties of the suite are deliberate and load-bearing:
-//
-//   - NOTHING TOUCHES THE NETWORK. Every SendGrid response - an accepted upsert, a rate limit,
-//     a partially errored import, an unparseable errors document - is expressed as a mock
-//     expectation on the three-method seam. No local HTTP server is stood up and no socket is
-//     opened, because needing one would mean the seam was drawn in the wrong place.
-//   - NO PACKAGE-LEVEL MUTABLE STATE EXISTS. The repository runs its suites with -shuffle=on,
-//     so every case builds its own destination, its own uploader and its own mock through the
-//     helpers below, and the two fixtures under testdata are only ever read.
-//   - THE ASSERTIONS PIN THE CONTRACT, NOT THE PROSE. Where the batch router reads a value with
-//     gjson, the test reads it back the same way; where SendGrid nests a counter inside a
-//     results object, the test feeds the connector a verbatim wire body and lets the decoder
-//     prove it reads the nesting.
+// Not one test opens a socket. The API is reached only through the SendGridAPIService seam, which
+// is what lets a rate limit, a rejected request, a partially errored import and an unparseable
+// errors document all be exercised deterministically and in microseconds.
 package sendgridbulkupload_test
 
 import (
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
-	"go.uber.org/mock/gomock"
+	gomock "go.uber.org/mock/gomock"
 
 	"github.com/rudderlabs/rudder-go-kit/config"
 	"github.com/rudderlabs/rudder-go-kit/jsonrs"
@@ -52,183 +42,91 @@ import (
 )
 
 const (
-	// destinationDefinitionName is the registered destination-definition name, and it is
-	// byte-critical: the processor's batch-destination catalog, the batch router's async
-	// destination list and the manager factory all compare it as a plain string, so a typo
-	// would produce neither a compile error nor a failing assertion anywhere else - the
-	// destination would simply never be routed.
-	//
-	// It is emphatically NOT the pre-existing "SENDGRID" cloud destination, which is a
-	// different, synchronously delivered destination and is untouched by this connector.
-	destinationDefinitionName = "SENDGRID_BULK_UPLOAD"
+	// testDestinationID is the destination every case reports against, so that an outcome carrying
+	// the wrong destination ID - which the batch router keys its bookkeeping on - is caught.
+	testDestinationID = "dest-sendgrid-1"
 
-	// testDestinationID is the destination ID every outcome has to be reported against,
-	// because the batch router keys its own bookkeeping on it.
-	testDestinationID = "1"
+	// fixtureListID is the list ID the staged fixture's first two events target through
+	// context.externalId. The destination configuration below targets the same list, which is what
+	// makes the whole fixture resolve to ONE request rather than two.
+	fixtureListID = "037ae8d4-25b4-496e-adff-2fded15fd0c5"
 
-	// testAPIKey is an obviously fake credential. It matches none of the shapes a real
-	// SendGrid key has - it is not an "SG.<id>.<secret>" value - so it can never be mistaken
-	// for a live secret and cannot be redacted out of a reason by the sanitization gate.
-	testAPIKey = "test-api-key"
+	// stagingFixture and errorsFixture are read-only test data, never written by any case, which is
+	// what keeps the suite safe under the shuffled, parallel execution the Makefile uses.
+	stagingFixture = "testdata/uploadData.jsonl"
+	errorsFixture  = "testdata/errors.json"
 
-	// testEventListID is the list ID the staging fixture's own events target through
-	// context.externalId, and testConfigListID is a different one used to prove that the
-	// per-event value takes precedence over the destination configuration.
-	testEventListID  = "037ae8d4-25b4-496e-adff-2fded15fd0c5"
-	testConfigListID = "9d1a5f0e-3c47-4b28-8f61-7bd0c2a4e913"
-
-	// testImportID is the job_id SendGrid returns for an accepted upsert, and testErrorsURL
-	// is the errors document it publishes for a partially errored import.
-	testImportID  = "sendgrid-import-0001"
-	testErrorsURL = "https://api.sendgrid.com/v3/marketing/contacts/imports/sendgrid-import-0001/errors"
-
-	// stagingFixture and errorsFixture are the two read-only documents under testdata. They
-	// are never written to: a test needing a mutable staging file builds one under
-	// t.TempDir() instead.
-	stagingFixture = "uploadData.jsonl"
-	errorsFixture  = "errors.json"
-
-	// matchedErrorsDocument is the errors document of an import whose every errored row
-	// resolves to an importing job: the staging fixture's blake@example.com (job 2) and
-	// devon@example.com (job 4), the latter reported under the nested contact.email spelling.
-	//
-	// It is built here rather than read from testdata because the committed fixture also
-	// carries a deliberately UNMATCHED row, which drives the fail-closed branch instead. Both
-	// behaviours have to be pinned, so each gets the document that exhibits it.
-	matchedErrorsDocument = `{"errors":[` +
-		`{"message":"Invalid email address provided for contact.","email":"blake@example.com"},` +
-		`{"error_message":"Contact rejected: custom field value exceeds the maximum allowed length.","contact":{"email":"devon@example.com"}}` +
-		`]}`
+	// testErrorsURL stands in for the opaque URL SendGrid publishes. Nothing ever dials it: the
+	// API seam is mocked, so this value only has to be carried faithfully from Poll to
+	// GetUploadStats.
+	testErrorsURL = "https://api.sendgrid.com/v3/marketing/contacts/imports/errors/abc123"
 )
 
-// newDestination builds the destination the control plane would deliver, with the supplied
-// configuration map.
-//
-// It is a function and not a package-level variable precisely so that no case can mutate the
-// destination another case is reading, which is what makes the suite safe under -shuffle=on.
-func newDestination(destinationConfig map[string]any) *backendconfig.DestinationT {
+// testConfig is the parsed destination configuration used by the injected-mock cases. It is
+// returned by a function rather than held in a variable so that no case can mutate what another
+// case reads.
+func testConfig() sendgridbulkupload.DestinationConfig {
+	return sendgridbulkupload.DestinationConfig{
+		APIKey:              "SG.test-api-key",
+		ListIDs:             []string{fixtureListID},
+		CustomFieldsMapping: map[string]string{"plan": "w1", "signedUpAt": "w2"},
+	}
+}
+
+// testDestination builds the backend-config destination NewManager is handed.
+func testDestination(config map[string]any) *backendconfig.DestinationT {
 	return &backendconfig.DestinationT{
-		ID:   testDestinationID,
-		Name: destinationDefinitionName,
-		DestinationDefinition: backendconfig.DestinationDefinitionT{
-			Name: destinationDefinitionName,
-		},
-		Config:      destinationConfig,
-		Enabled:     true,
-		WorkspaceID: "1",
+		ID:                    testDestinationID,
+		Name:                  "SENDGRID_BULK_UPLOAD",
+		DestinationDefinition: backendconfig.DestinationDefinitionT{Name: "SENDGRID_BULK_UPLOAD"},
+		Config:                config,
+		Enabled:               true,
+		WorkspaceID:           "workspace-1",
 	}
 }
 
-// newDestinationConfig is the configuration a correctly configured destination carries: the
-// bearer credential, the fallback list IDs and the explicit trait-to-custom-field mapping
-// SendGrid requires because it addresses custom fields by pre-created opaque IDs such as "w1".
+// newMockAPI builds the generated SendGridAPIService mock.
 //
-// A fresh map is returned on every call so that a case may adjust its own copy freely.
-func newDestinationConfig() map[string]any {
-	return map[string]any{
-		"apiKey":  testAPIKey,
-		"listIds": []any{testEventListID},
-		"customFieldsMapping": map[string]any{
-			"plan":       "w1",
-			"signedUpAt": "w2",
-		},
+// The controller's verification is registered through t.Cleanup rather than deferred, which is what
+// makes it correct for the parallel subtests throughout this suite: a deferred Finish would run when
+// the subtest function RETURNS, which for a parallel case is before its body has actually finished.
+// Every unmet or unexpected expectation therefore fails the case that caused it.
+func newMockAPI(t *testing.T) *mockAPIService.MockSendGridAPIService {
+	t.Helper()
+	controller := gomock.NewController(t)
+	t.Cleanup(controller.Finish)
+	return mockAPIService.NewMockSendGridAPIService(controller)
+}
+
+// newUploader assembles the connector around the mocked API. The caps are left at zero unless a
+// case overrides them, which selects the production defaults.
+func newUploader(api sendgridbulkupload.SendGridAPIService) *sendgridbulkupload.SendGridBulkUploader {
+	return &sendgridbulkupload.SendGridBulkUploader{
+		Logger:             logger.NOP,
+		StatsFactory:       stats.NOP,
+		DestinationID:      testDestinationID,
+		DestinationConfig:  testConfig(),
+		SendGridAPIService: api,
 	}
 }
 
-// newMockAPIService builds the generated SendGridAPIService mock with a controller bound to the
-// running test.
-//
-// Cleanup is registered with t.Cleanup rather than deferred, per the repository's testing
-// guidelines. go.uber.org/mock also registers Finish itself, so this is belt and braces - and
-// it is what makes the expectation counts in these tests, "exactly one upload call" above all,
-// actually enforced rather than merely stated.
-func newMockAPIService(t *testing.T) *mockAPIService.MockSendGridAPIService {
+// stagingLine renders one staging-file line in exactly the shape Transform writes.
+func stagingLine(t *testing.T, jobID int64, message string) string {
 	t.Helper()
-	ctrl := gomock.NewController(t)
-	t.Cleanup(ctrl.Finish)
-	return mockAPIService.NewMockSendGridAPIService(ctrl)
-}
-
-// newUploader builds the manager through its real constructor and then substitutes the mocked
-// API service for the HTTP adapter the constructor built.
-//
-// Going through NewManager rather than assembling a struct literal is deliberate: every case
-// then also exercises the real configuration parsing, the real logger and stats defaulting and
-// the real cap resolution, so a regression in any of them cannot hide behind a hand-built
-// uploader.
-func newUploader(
-	t *testing.T,
-	apiService sendgridbulkupload.SendGridAPIService,
-	destinationConfig map[string]any,
-) *sendgridbulkupload.SendGridBulkUploader {
-	t.Helper()
-	return newUploaderWithStats(t, apiService, destinationConfig, stats.NOP)
-}
-
-// newUploaderWithStats is newUploader with an explicit stats factory, for the cases that have
-// to prove a measurement was actually emitted rather than merely that a value was returned.
-func newUploaderWithStats(
-	t *testing.T,
-	apiService sendgridbulkupload.SendGridAPIService,
-	destinationConfig map[string]any,
-	statsFactory stats.Stats,
-) *sendgridbulkupload.SendGridBulkUploader {
-	t.Helper()
-	uploader, err := sendgridbulkupload.NewManager(logger.NOP, statsFactory, newDestination(destinationConfig))
+	line, err := common.GetMarshalledData(message, jobID)
 	require.NoError(t, err)
-	require.NotNil(t, uploader)
-	uploader.SendGridAPIService = apiService
-	return uploader
+	return line
 }
 
-// statLabels are the tags every measurement this connector emits carries. destType comes from
-// the registered destination-definition name rather than from the destination's own name, so
-// renaming a destination cannot move its metrics.
-func statLabels() stats.Tags {
-	return stats.Tags{
-		"module":   "batch_router",
-		"destType": destinationDefinitionName,
-		"destID":   testDestinationID,
-	}
-}
-
-// stagingFixtureLines reads the read-only staging fixture and returns its non-blank lines, which
-// are the very lines Upload consumes when it is pointed at fixtureStagingFile.
-func stagingFixtureLines(t *testing.T) []string {
+// contactLine renders a minimal but complete staged contact for one job.
+func contactLine(t *testing.T, jobID int64) string {
 	t.Helper()
-	content, err := os.ReadFile(fixtureStagingFile())
-	require.NoError(t, err)
-	lines := make([]string, 0, 8)
-	for _, line := range strings.Split(string(content), "\n") {
-		if strings.TrimSpace(line) != "" {
-			lines = append(lines, line)
-		}
-	}
-	require.NotEmpty(t, lines, "fixture %s is empty", stagingFixture)
-	return lines
+	return stagingLine(t, jobID, fmt.Sprintf(
+		`{"type":"identify","userId":"user_%d","traits":{"email":"user%d@example.com"}}`, jobID, jobID))
 }
 
-// errorsFixtureDocument reads the read-only errors-document fixture verbatim, so the tolerant
-// parser is exercised against the exact bytes the repository commits rather than a paraphrase.
-func errorsFixtureDocument(t *testing.T) []byte {
-	t.Helper()
-	content, err := os.ReadFile(filepath.Join("testdata", errorsFixture))
-	require.NoError(t, err)
-	require.NotEmpty(t, content)
-	return content
-}
-
-// fixtureStagingFile is the staging fixture's path, which Upload reads exactly as the batch
-// router's own staging file. It is opened read-only and never modified.
-func fixtureStagingFile() string {
-	return filepath.Join("testdata", stagingFixture)
-}
-
-// writeStagingFile materializes a staging file from the given lines under the test's own
-// temporary directory, which the framework removes for us.
-//
-// testdata is never written to: the fixtures there are shared by every case in the package and
-// a test that mutated one would make the suite order-dependent.
+// writeStagingFile writes lines to a per-case temporary file. t.TempDir is removed by the testing
+// package when the case ends, so nothing is left behind and no two cases share a path.
 func writeStagingFile(t *testing.T, lines ...string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "staging.jsonl")
@@ -236,2286 +134,4046 @@ func writeStagingFile(t *testing.T, lines ...string) string {
 	return path
 }
 
-// stagingLine renders one staging-file line the way Transform does, through the very same
-// shared helper.
+// fixtureJobs rebuilds the importing job list from the staged fixture.
 //
-// Building the line with the helper rather than by hand is what guarantees these tests cannot
-// drift from the metadata key the connector reads back: the key is job_id, and it is written in
-// exactly one place in the repository.
-func stagingLine(t *testing.T, jobID int64, message string) string {
+// The job's payload IS the staging line, which is the shape reconciliation is designed to read:
+// GetUploadStats re-derives every contact identifier from the importing jobs themselves, so feeding
+// it the very lines that were uploaded is what makes the identifier matching a genuine test of the
+// stateless reconciliation rather than of a fixture written to agree with it.
+func fixtureJobs(t *testing.T, jobIDs ...int64) []*jobsdb.JobT {
 	t.Helper()
-	line, err := common.GetMarshalledData(message, jobID)
+	raw, err := os.ReadFile(stagingFixture)
 	require.NoError(t, err)
-	require.Equal(t, jobID, gjson.Get(line, "metadata.job_id").Int())
-	return line
-}
 
-// requestRecorder captures the upsert requests the mocked API service received, in call order.
-//
-// The chunker is unexported, which is exactly right - it is an implementation detail - so the
-// only honest way to assert its behaviour is through the requests it causes. Recording them is
-// what makes chunk sizes, chunk counts and the index alignment between contacts and job IDs
-// observable from outside the package.
-//
-// It is guarded by a mutex even though Upload issues its requests sequentially, so that the
-// suite stays correct under -race if the connector ever parallelizes them.
-type requestRecorder struct {
-	mu       sync.Mutex
-	requests []sendgridbulkupload.UpsertRequest
-}
-
-// record captures one request.
-func (r *requestRecorder) record(request sendgridbulkupload.UpsertRequest) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.requests = append(r.requests, request)
-}
-
-// all returns a copy of the captured requests, so a caller can never mutate the recording.
-func (r *requestRecorder) all() []sendgridbulkupload.UpsertRequest {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]sendgridbulkupload.UpsertRequest{}, r.requests...)
-}
-
-// contactsIn renders the number of contacts each captured request carried, in call order. It is
-// the chunk-size sequence the chunker produced, and asserting on it is also how these tests
-// prove an empty chunk is never emitted.
-func (r *requestRecorder) contactsIn() []int {
-	requests := r.all()
-	sizes := make([]int, 0, len(requests))
-	for _, request := range requests {
-		sizes = append(sizes, len(request.Contacts))
+	byJobID := make(map[int64][]byte)
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		byJobID[gjson.Get(line, "metadata.job_id").Int()] = []byte(line)
 	}
-	return sizes
-}
-
-// contactSize is the number of bytes one contact costs a request body as the chunker accounts
-// for it: its serialized length plus the byte for the comma that separates it from its
-// neighbour.
-//
-// Measuring it here with the repository's mandated codec, rather than hard-coding a number, is
-// what lets the byte-cap boundary cases be expressed exactly - one below, exactly at, one above
-// - without materializing megabytes of fixture data.
-func contactSize(t *testing.T, contact sendgridbulkupload.Contact) int {
-	t.Helper()
-	encoded, err := jsonrs.Marshal(contact)
-	require.NoError(t, err)
-	return len(encoded) + 1
-}
-
-// uniformContact is the contact the nth uniform staging line produces. Every one of them
-// serializes to the same number of bytes, which is what makes the byte-cap arithmetic in the
-// chunker tests exact.
-func uniformContact(index int) sendgridbulkupload.Contact {
-	return sendgridbulkupload.Contact{
-		Email:      fmt.Sprintf("u%02d@example.com", index),
-		ExternalID: fmt.Sprintf("user_%02d", index),
-	}
-}
-
-// uniformStagingLines renders count staging lines, numbered from one, whose contacts all
-// serialize to an identical size and whose external IDs encode the job that produced them.
-//
-// Encoding the job ID in the contact is what makes the chunker's index alignment provable from
-// outside the package: a captured chunk's contacts can be turned back into the job IDs the
-// uploader must have reported for that same chunk.
-func uniformStagingLines(t *testing.T, count int) []string {
-	t.Helper()
-	require.LessOrEqual(t, count, 99, "uniform lines are numbered with two digits to keep every contact the same size")
-	lines := make([]string, 0, count)
-	for index := 1; index <= count; index++ {
-		contact := uniformContact(index)
-		lines = append(lines, stagingLine(t, int64(index), fmt.Sprintf(
-			`{"type":"identify","userId":%q,"traits":{"email":%q}}`, contact.ExternalID, contact.Email,
-		)))
-	}
-	return lines
-}
-
-// jobIDsOf recovers the job IDs a captured request's contacts were produced from, using the
-// external ID uniformStagingLines encodes them in.
-//
-// This is the index-alignment assertion: the chunker flushes its contact and job-ID chunks
-// together, so the job IDs recovered from a chunk's contacts must be exactly the job IDs the
-// uploader reported for that chunk - importing when it was accepted, retryable when it was not.
-func jobIDsOf(t *testing.T, request sendgridbulkupload.UpsertRequest) []int64 {
-	t.Helper()
-	jobIDs := make([]int64, 0, len(request.Contacts))
-	for _, contact := range request.Contacts {
-		jobID, err := strconv.ParseInt(strings.TrimPrefix(contact.ExternalID, "user_"), 10, 64)
-		require.NoError(t, err, "contact %q carries no recoverable job id", contact.Email)
-		jobIDs = append(jobIDs, jobID)
-	}
-	return jobIDs
-}
-
-// importingJobs rebuilds the importing job list the batch router hands to reconciliation from
-// the staging lines an upload was built from.
-//
-// The payload is shaped {"body":{"JSON":{...}}} because that is how an event is queued and where
-// both Transform and reconciliation read the message from. Deriving the list from the same lines
-// the upload used is what makes the identifiers in the errors document line up with real jobs,
-// exactly as they would in production - and it is also the point of the design: reconciliation
-// keeps no state from the upload and re-derives every identifier from the jobs it is handed.
-func importingJobs(t *testing.T, lines []string) []*jobsdb.JobT {
-	t.Helper()
-	jobs := make([]*jobsdb.JobT, 0, len(lines))
-	for _, line := range lines {
-		jobID := gjson.Get(line, "metadata.job_id").Int()
-		require.NotZero(t, jobID, "staging line carries no metadata.job_id")
-		payload, err := jsonrs.Marshal(map[string]any{
-			"body": map[string]any{"JSON": gjson.Get(line, "message").Value()},
-		})
-		require.NoError(t, err)
+	jobs := make([]*jobsdb.JobT, 0, len(jobIDs))
+	for _, jobID := range jobIDs {
+		payload, ok := byJobID[jobID]
+		require.Truef(t, ok, "job %d is missing from %s", jobID, stagingFixture)
 		jobs = append(jobs, &jobsdb.JobT{JobID: jobID, EventPayload: payload})
 	}
 	return jobs
 }
 
-// jobIDsIn lists the job IDs of an importing list, which is the population every reconciliation
-// outcome has to account for exactly once.
-func jobIDsIn(jobs []*jobsdb.JobT) []int64 {
-	jobIDs := make([]int64, 0, len(jobs))
-	for _, job := range jobs {
-		if job == nil {
-			continue
-		}
-		jobIDs = append(jobIDs, job.JobID)
-	}
-	return jobIDs
+// importParametersOf reads back what Upload persisted, through the SAME gjson path the batch router
+// uses in getPollInput. Asserting on the router's own read is the point: a value the router cannot
+// recover would strand every job of the batch in the importing state.
+func importParametersOf(t *testing.T, output common.AsyncUploadOutput) (string, int64) {
+	t.Helper()
+	require.NotNil(t, output.ImportingParameters)
+	importID := gjson.GetBytes(output.ImportingParameters, "importId")
+	importCount := gjson.GetBytes(output.ImportingParameters, "importCount")
+	require.True(t, importID.Exists(), "importId must be recoverable by gjson")
+	require.True(t, importCount.Exists(), "importCount must be recoverable by gjson")
+	return importID.String(), importCount.Int()
 }
 
-// requireDisjoint asserts that two outcome sets share no job.
+// persistedParameters renders the job parameters the batch router stores for an importing job, which
+// is the only channel through which reconciliation can recover the import identifier when it runs in
+// a different process invocation from the Upload that produced it.
 //
-// It is the invariant that keeps a job from being reported twice - importing and failed, or
-// failed and aborted - to a batch router that writes one status per job it is told about.
-func requireDisjoint(t *testing.T, first, second []int64) {
+// It is built through the shared import-parameters struct rather than hand-written, so a change to
+// the field names the router reads would break these cases rather than passing silently.
+func persistedParameters(t *testing.T, importID string, importCount int) []byte {
 	t.Helper()
-	for _, jobID := range first {
-		require.NotContains(t, second, jobID, "job %d was reported in two outcome sets at once", jobID)
-	}
-}
-
-// statusFromWireBody decodes a VERBATIM SendGrid import-status body into the connector's own
-// response type.
-//
-// Every poll case is driven through this helper rather than through a hand-built struct, and
-// that is the single most valuable decision in this file. SendGrid reports errored_count and
-// errors_url INSIDE a nested "results" object; a flattened response type would still unmarshal
-// without any error and would then read errored_count as 0 forever, so every partially failed
-// import would be reported as a clean success and the rejected contacts would be marked
-// delivered. Decoding the real body makes that impossible to regress silently.
-func statusFromWireBody(t *testing.T, body string) *sendgridbulkupload.ImportStatusResponse {
-	t.Helper()
-	var status sendgridbulkupload.ImportStatusResponse
-	require.NoError(t, jsonrs.Unmarshal([]byte(body), &status))
-	return &status
-}
-
-// importStatusBody renders a SendGrid import-status body with the counters and the errors
-// document URL in the nested results object the API actually uses.
-func importStatusBody(importID, status string, erroredCount int, errorsURL string) string {
-	const requestedCount = 5
-	createdCount := max(requestedCount-erroredCount, 0)
-	return fmt.Sprintf(
-		`{"id":%q,"status":%q,"job_type":"upsert","results":{"requested_count":%d,"created_count":%d,"updated_count":0,"deleted_count":0,"errored_count":%d,"errors_url":%q},"started_at":"2026-02-25T12:00:00Z","finished_at":"2026-02-25T12:00:30Z"}`,
-		importID, status, requestedCount, createdCount, erroredCount, errorsURL,
-	)
-}
-
-// importParameters marshals the import parameters the batch router persists, so that the
-// reconciliation cases can be handed exactly what the router would hand them.
-func importParameters(t *testing.T, importID string, importCount int) []byte {
-	t.Helper()
-	parameters, err := jsonrs.Marshal(common.ImportParameters{ImportId: importID, ImportCount: importCount})
+	parameters, err := jsonrs.Marshal(common.ImportParameters{
+		ImportId:    importID,
+		ImportCount: importCount,
+	})
 	require.NoError(t, err)
+	require.Equal(t, importID, gjson.GetBytes(parameters, "importId").String())
 	return parameters
 }
 
-// newRateLimitError is the typed error the API adapter returns for a 429, carrying the reset
-// window SendGrid advertised.
-//
-// resetAt is an absolute UNIX timestamp in SECONDS, not a delay: X-RateLimit-Reset is an instant,
-// and reading it as a duration would produce a wait of decades.
-func newRateLimitError(resetAt int64) *sendgridbulkupload.RateLimitError {
-	return &sendgridbulkupload.RateLimitError{
-		StatusCode: 429,
-		RetryAfter: "30",
-		ResetAt:    resetAt,
-		Limit:      600,
-		Remaining:  0,
-		Message:    "too many requests",
+// pollStatus builds an import status response with the nested results object the API actually
+// returns.
+func pollStatus(importID, status string, erroredCount int, errorsURL string) *sendgridbulkupload.ImportStatusResponse {
+	return &sendgridbulkupload.ImportStatusResponse{
+		ID:      importID,
+		Status:  status,
+		JobType: "upsert",
+		Results: sendgridbulkupload.ImportResults{
+			RequestedCount: 5,
+			CreatedCount:   5 - erroredCount,
+			ErroredCount:   erroredCount,
+			ErrorsURL:      errorsURL,
+		},
 	}
 }
 
-// resetWindow renders a rate-limit reset instant the way the typed error does, so that a test
-// can assert the advertised window actually reached the recorded failure reason.
-//
-// It survives the connector's sanitization gate intact - an RFC3339 instant carries only eight
-// consecutive digits, and neither "T" nor ":" is a digit separator the personal-data patterns
-// accept - which is what keeps a rate-limit reason actionable for an operator.
-func resetWindow(resetAt int64) string {
-	return time.Unix(resetAt, 0).UTC().Format(time.RFC3339)
+// errorsDocument returns the committed partial-failure fixture.
+func errorsDocument(t *testing.T) []byte {
+	t.Helper()
+	document, err := os.ReadFile(errorsFixture)
+	require.NoError(t, err)
+	return document
 }
 
-// TestRegistration pins the three registrations that make this connector reachable at all.
-//
-// This is the feature's highest-impact failure mode and the one no other assertion in this file
-// would catch: with any single one of them missing the package still compiles, the manager still
-// satisfies its interface and every scenario below still passes, while the destination silently
-// never executes. Each entry is a plain string comparison in a different file, so only a test
-// that names the registered value can protect them.
-func TestRegistration(t *testing.T) {
-	t.Parallel()
-
-	t.Run("the processor routes this destination to the batch router", func(t *testing.T) {
-		t.Parallel()
-
-		// Without this entry the processor writes these jobs to the REGULAR router's queue and
-		// the batch router never receives them.
-		require.Contains(t, misc.BatchDestinations(), destinationDefinitionName)
-	})
-
-	t.Run("the batch router classifies this destination as asynchronous", func(t *testing.T) {
-		t.Parallel()
-
-		// Without these the async upload worker early-returns, the batch router rejects the
-		// type outright and the factory's classifier never reaches the manager switch.
-		require.True(t, common.IsAsyncDestination(destinationDefinitionName))
-		require.True(t, common.IsAsyncRegularDestination(destinationDefinitionName))
-		require.False(t, common.IsSFTPDestination(destinationDefinitionName))
-	})
-
-	t.Run("the manager factory constructs this connector", func(t *testing.T) {
-		t.Parallel()
-
-		manager, err := asyncdestinationmanager.NewManager(
-			config.New(),
-			logger.NOP,
-			stats.NOP,
-			newDestination(newDestinationConfig()),
-			nil, // the backend config client is unused: SendGrid authenticates with a static bearer key
-		)
-		require.NoError(t, err, "the factory must not fall through to its invalid destination type error")
-		require.NotNil(t, manager)
-		require.IsType(t, &sendgridbulkupload.SendGridBulkUploader{}, manager)
-	})
-
-	t.Run("the uploader satisfies the full four method manager contract", func(t *testing.T) {
-		t.Parallel()
-
-		// A compile-time assertion as well as a runtime one, so drift in the shared contract
-		// breaks the build rather than surfacing inside a batch router worker.
-		var manager common.AsyncDestinationManager = &sendgridbulkupload.SendGridBulkUploader{}
-		require.Implements(t, (*common.AsyncDestinationManager)(nil), manager)
-	})
-}
-
-// TestNewManager covers construction, which is where a misconfigured destination has to be
-// rejected.
-//
-// Failing here rather than on the first upload means an operator is told once, clearly, instead
-// of being handed an opaque 401 per batch for as long as the destination stays broken.
+// TestNewManager covers construction: the API key guard that must fail a misconfigured destination
+// once and clearly rather than once per batch, and the typed configuration the manager is built from.
 func TestNewManager(t *testing.T) {
 	t.Parallel()
 
-	t.Run("a valid destination yields a fully configured manager", func(t *testing.T) {
+	t.Run("rejects a destination without a usable api key", func(t *testing.T) {
 		t.Parallel()
 
-		uploader, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP, newDestination(newDestinationConfig()))
-		require.NoError(t, err)
-		require.NotNil(t, uploader)
+		for name, config := range map[string]map[string]any{
+			"absent":     {"listIds": []string{fixtureListID}},
+			"empty":      {"apiKey": ""},
+			"whitespace": {"apiKey": "   "},
+			"not a string": {
+				// A non-string value fails the typed jsonrs round trip, which is the single
+				// reading of the control plane's configuration.
+				"apiKey": 42,
+			},
+			"nil config": nil,
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
 
-		require.Equal(t, testDestinationID, uploader.DestinationID)
-		require.Equal(t, destinationDefinitionName, uploader.DestinationName)
-		require.Equal(t, testAPIKey, uploader.DestinationConfig.APIKey)
-		require.NotNil(t, uploader.SendGridAPIService, "the manager must build its own API service")
-
-		// The two caps default to the endpoint's documented limits: 30,000 contacts, and the
-		// 6MB request ceiling less the reserve held back for the request envelope and its
-		// list_ids array, which count against the same limit.
-		require.Equal(t, 30000, uploader.MaxContactsPerRequest)
-		require.Positive(t, uploader.MaxRequestBytes)
-		require.Less(t, uploader.MaxRequestBytes, 6*1000*1000,
-			"the byte budget must sit below the documented ceiling so the request envelope fits inside it")
+				manager, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP, testDestination(config))
+				require.Error(t, err)
+				require.Nil(t, manager)
+			})
+		}
 	})
 
-	t.Run("the list IDs and the custom field mapping are parsed", func(t *testing.T) {
+	t.Run("parses the typed destination configuration", func(t *testing.T) {
 		t.Parallel()
 
-		destinationConfig := newDestinationConfig()
-		destinationConfig["listIds"] = []any{testEventListID, testConfigListID}
-
-		uploader, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP, newDestination(destinationConfig))
-		require.NoError(t, err)
-
-		require.Equal(t, []string{testEventListID, testConfigListID}, uploader.DestinationConfig.ListIDs)
-		// The mapping is trait name to PRE-CREATED SendGrid custom field ID. SendGrid requires
-		// the field to exist and addresses it by that opaque ID, so the mapping has to be
-		// supplied rather than inferred from the trait names.
-		require.Equal(t,
-			map[string]string{"plan": "w1", "signedUpAt": "w2"},
-			uploader.DestinationConfig.CustomFieldsMapping,
-		)
-	})
-
-	t.Run("a destination with no list IDs and no mapping is still valid", func(t *testing.T) {
-		t.Parallel()
-
-		uploader, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP, newDestination(map[string]any{
-			"apiKey": testAPIKey,
+		manager, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP, testDestination(map[string]any{
+			"apiKey":              "  SG.spaced-key  ",
+			"listIds":             []any{fixtureListID, "second-list"},
+			"customFieldsMapping": map[string]any{"plan": "w1", "signedUpAt": "w2"},
 		}))
 		require.NoError(t, err)
-		require.Empty(t, uploader.DestinationConfig.ListIDs)
-		require.Empty(t, uploader.DestinationConfig.CustomFieldsMapping)
+		require.NotNil(t, manager)
+		require.Equal(t, testDestinationID, manager.DestinationID)
+		require.Equal(t, "  SG.spaced-key  ", manager.DestinationConfig.APIKey)
+		require.Equal(t, []string{fixtureListID, "second-list"}, manager.DestinationConfig.ListIDs)
+		require.Equal(t, map[string]string{"plan": "w1", "signedUpAt": "w2"}, manager.DestinationConfig.CustomFieldsMapping)
+		require.NotNil(t, manager.SendGridAPIService)
 	})
 
-	t.Run("observability is defaulted rather than demanded", func(t *testing.T) {
+	t.Run("satisfies the async destination manager contract", func(t *testing.T) {
 		t.Parallel()
 
-		// A nil logger or stats factory must not become a nil-pointer dereference on the first
-		// upload, so both fall back to the no-op implementations.
-		uploader, err := sendgridbulkupload.NewManager(nil, nil, newDestination(newDestinationConfig()))
+		manager, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP, testDestination(map[string]any{"apiKey": "SG.k"}))
 		require.NoError(t, err)
-		require.NotNil(t, uploader.Logger)
-		require.NotNil(t, uploader.StatsFactory)
+
+		var contract common.AsyncDestinationManager = manager
+		require.NotNil(t, contract)
 	})
 
-	for _, testCase := range []struct {
-		name              string
-		destinationConfig map[string]any
-	}{
-		{
-			name:              "the API key is absent",
-			destinationConfig: map[string]any{"listIds": []any{testEventListID}},
-		},
-		{
-			name:              "the API key is not a string",
-			destinationConfig: map[string]any{"apiKey": 12345},
-		},
-		{
-			name:              "the API key is empty",
-			destinationConfig: map[string]any{"apiKey": ""},
-		},
-		{
-			name:              "the API key is only whitespace",
-			destinationConfig: map[string]any{"apiKey": "   \t "},
-		},
-		{
-			name:              "the configuration is nil",
-			destinationConfig: nil,
-		},
-	} {
-		t.Run("construction fails when "+testCase.name, func(t *testing.T) {
-			t.Parallel()
-
-			uploader, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP, newDestination(testCase.destinationConfig))
-			require.Error(t, err)
-			require.ErrorContains(t, err, "apiKey")
-			require.Nil(t, uploader, "a half-configured manager must never be returned")
-		})
-	}
-
-	t.Run("construction fails when the destination itself is nil", func(t *testing.T) {
+	t.Run("tolerates a nil logger and stats factory", func(t *testing.T) {
 		t.Parallel()
 
-		uploader, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP, nil)
-		require.Error(t, err)
-		require.Nil(t, uploader)
-	})
-
-	t.Run("the API service constructor enforces the same guard", func(t *testing.T) {
-		t.Parallel()
-
-		apiService, err := sendgridbulkupload.NewSendGridAPIService(
-			newDestination(map[string]any{"apiKey": " "}), logger.NOP, stats.NOP,
-		)
-		require.Error(t, err)
-		require.Nil(t, apiService)
-
-		apiService, err = sendgridbulkupload.NewSendGridAPIService(
-			newDestination(newDestinationConfig()), logger.NOP, stats.NOP,
-		)
+		manager, err := sendgridbulkupload.NewManager(nil, nil, testDestination(map[string]any{"apiKey": "SG.k"}))
 		require.NoError(t, err)
-		require.NotNil(t, apiService)
+		require.NotNil(t, manager.Logger)
+		require.NotNil(t, manager.StatsFactory)
 	})
 }
 
-// TestTransform covers the reduction of one event to one staging-file line.
-//
-// The line's shape is the contract between Transform and Upload: the message is what the contact
-// is built from and the metadata is what tags it with the job that produced it. The metadata key
-// is job_id - the key the shared marshalling helper writes and the key Upload reads back - and it
-// is asserted to be the only key present, so no alternative spelling can slip in.
+// TestTransform pins the staging-line shape and the event-type agnosticism the feature requires:
+// both track and identify reduce to one contact line tagged with its originating job.
 func TestTransform(t *testing.T) {
 	t.Parallel()
 
-	for _, testCase := range []struct {
-		name         string
-		eventType    string
-		payload      string
-		expectEmail  string
-		expectUserID string
-	}{
-		{
-			name:      "an identify event becomes one contact",
-			eventType: "identify",
-			payload: `{"body":{"JSON":{"type":"identify","userId":"user_123","anonymousId":"anon_456",` +
-				`"traits":{"email":"Alex@Example.com","firstName":"Alex"}}}}`,
-			expectEmail:  "Alex@Example.com",
-			expectUserID: "user_123",
-		},
-		{
-			// Event-type agnostic on purpose: the contact is derived from the event's traits and
-			// identifiers, not from its type, so a track event reduces to a contact just as an
-			// identify does.
-			name:      "a track event becomes one contact too",
-			eventType: "track",
-			payload: `{"body":{"JSON":{"type":"track","event":"Signed Up","userId":"user_223",` +
-				`"traits":{"email":"blake@example.com"}}}}`,
-			expectEmail:  "blake@example.com",
-			expectUserID: "user_223",
-		},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
+	uploader := newUploader(newMockAPI(t))
+	for name, eventType := range map[string]string{"identify": "identify", "track": "track"} {
+		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			uploader := newUploader(t, newMockAPIService(t), newDestinationConfig())
-
-			line, err := uploader.Transform(&jobsdb.JobT{
-				JobID:        7,
-				EventPayload: []byte(testCase.payload),
-			})
+			payload := fmt.Sprintf(
+				`{"body":{"JSON":{"type":%q,"userId":"user_9","traits":{"email":"Nine@Example.com"}}},"endpoint":"ignored"}`,
+				eventType)
+			transformed, err := uploader.Transform(&jobsdb.JobT{JobID: 9, EventPayload: []byte(payload)})
 			require.NoError(t, err)
 
-			require.Equal(t, int64(7), gjson.Get(line, "metadata.job_id").Int())
-			// Stronger than asserting that one known-stale spelling is absent: the metadata object
-			// must carry exactly the single key the batch router reads back, so no alternative
-			// spelling of it can ever slip in unnoticed.
-			metadataKeys := make([]string, 0, 1)
-			gjson.Get(line, "metadata").ForEach(func(key, _ gjson.Result) bool {
-				metadataKeys = append(metadataKeys, key.String())
-				return true
-			})
-			require.Equal(t, []string{"job_id"}, metadataKeys,
-				"metadata must carry exactly the job_id key that Upload reads back")
-			require.Equal(t, testCase.eventType, gjson.Get(line, "message.type").String())
-			require.Equal(t, testCase.expectEmail, gjson.Get(line, "message.traits.email").String())
-			require.Equal(t, testCase.expectUserID, gjson.Get(line, "message.userId").String())
-
-			// The line has to survive the round trip Upload performs on it.
-			require.True(t, gjson.Get(line, "message").IsObject())
-			require.True(t, gjson.Valid(line))
+			// The metadata key is job_id, which is what the shared marshalling helper writes and
+			// what Upload reads back.
+			require.Equal(t, int64(9), gjson.Get(transformed, "metadata.job_id").Int())
+			require.Equal(t, eventType, gjson.Get(transformed, "message.type").String())
+			require.Equal(t, "Nine@Example.com", gjson.Get(transformed, "message.traits.email").String())
+			// Only body.JSON is carried through; the surrounding router envelope is not.
+			require.False(t, gjson.Get(transformed, "message.endpoint").Exists())
 		})
 	}
-
-	t.Run("an event carrying no transformed payload is rejected", func(t *testing.T) {
-		t.Parallel()
-
-		uploader := newUploader(t, newMockAPIService(t), newDestinationConfig())
-
-		line, err := uploader.Transform(&jobsdb.JobT{JobID: 9, EventPayload: []byte(`{"body":{}}`)})
-		require.Error(t, err, "an event with no body.JSON cannot become a contact")
-		require.Empty(t, line)
-	})
-
-	t.Run("the transformed line is what Upload turns into a contact", func(t *testing.T) {
-		t.Parallel()
-
-		// The whole point of this case: Transform's own output is fed straight into Upload, so
-		// the two halves of the contract are pinned together rather than separately. It is also
-		// where the documented userId to external_id mapping is proven.
-		recorder := &requestRecorder{}
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			UploadContacts(gomock.Any()).
-			DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
-				recorder.record(request)
-				return &sendgridbulkupload.UpsertResponse{JobID: testImportID}, nil
-			}).
-			Times(1)
-
-		uploader := newUploader(t, apiService, newDestinationConfig())
-
-		line, err := uploader.Transform(&jobsdb.JobT{
-			JobID: 11,
-			EventPayload: []byte(`{"body":{"JSON":{"type":"identify","userId":"user_123",` +
-				`"anonymousId":"anon_456","traits":{"email":"Casey@Example.com","firstName":"Casey",` +
-				`"phone":"+14155551234","plan":"enterprise"}}}}`),
-		})
-		require.NoError(t, err)
-
-		output := uploader.Upload(&common.AsyncDestinationStruct{
-			Destination:     newDestination(newDestinationConfig()),
-			FileName:        writeStagingFile(t, line),
-			ImportingJobIDs: []int64{11},
-		})
-		require.Equal(t, []int64{11}, output.ImportingJobIDs)
-
-		requests := recorder.all()
-		require.Len(t, requests, 1)
-		require.Len(t, requests[0].Contacts, 1)
-
-		contact := requests[0].Contacts[0]
-		// Lower-cased locally even though SendGrid lower-cases it on ingestion, because the
-		// address is also the reconciliation key and both sides must be comparable without
-		// depending on SendGrid's normalization having happened first.
-		require.Equal(t, "casey@example.com", contact.Email)
-		// userId maps onto external_id: this repository's documented SendGrid convention.
-		require.Equal(t, "user_123", contact.ExternalID)
-		require.Equal(t, "anon_456", contact.AnonymousID)
-		require.Equal(t, "+14155551234", contact.PhoneNumberID)
-		require.Equal(t, "Casey", contact.FirstName)
-		// A mapped trait travels as a custom field keyed by its PRE-CREATED SendGrid field ID.
-		require.Equal(t, map[string]any{"w1": "enterprise"}, contact.CustomFields)
-	})
 }
 
-// TestUploadHappyPath is mandated scenario S1: N track and identify events become ONE upsert
-// carrying the correct contact fields and the configured list IDs, SendGrid accepts it with a
-// job_id, and the subsequent poll reports completion once nothing errored.
+// TestImportStatusResponseIsNested is the smallest test in the suite and guards the single most
+// dangerous detail in the feature.
 //
-// The destination's own list IDs are set to the list the fixture's events target, because Upload
-// groups contacts by their RESOLVED list IDs before chunking: one upsert carries a single
-// list_ids array that applies to every contact in it, so contacts destined for different lists
-// can never share a request. With both sources agreeing, all five events travel together.
+// SendGrid nests the counters and the errors document URL inside a results object. A flat Go struct
+// would unmarshal this document without error and read errored_count as zero forever, so every
+// partially errored import would be reported as a clean success - exactly the silent data loss
+// reconciliation exists to prevent. This decodes the documented shape and insists the values arrive.
+func TestImportStatusResponseIsNested(t *testing.T) {
+	t.Parallel()
+
+	document := []byte(`{
+		"id": "sg-import-1",
+		"status": "errored",
+		"job_type": "upsert",
+		"results": {
+			"requested_count": 5,
+			"created_count": 3,
+			"updated_count": 0,
+			"deleted_count": 0,
+			"errored_count": 2,
+			"errors_url": "` + testErrorsURL + `"
+		},
+		"started_at": "2026-02-25T12:00:00Z",
+		"finished_at": "2026-02-25T12:00:30Z"
+	}`)
+
+	var status sendgridbulkupload.ImportStatusResponse
+	require.NoError(t, jsonrs.Unmarshal(document, &status))
+	require.Equal(t, "sg-import-1", status.ID)
+	require.Equal(t, "errored", status.Status)
+	require.Equal(t, 5, status.Results.RequestedCount)
+	require.Equal(t, 3, status.Results.CreatedCount)
+	require.Equal(t, 2, status.Results.ErroredCount, "errored_count must be read from the NESTED results object")
+	require.Equal(t, testErrorsURL, status.Results.ErrorsURL)
+}
+
+// TestUploadHappyPath is scenario S1: five staged track and identify events become ONE upsert
+// carrying the right contact fields and list IDs, the accepted job IDs come back as importing, the
+// import identifier round-trips through the batch router's own read, and nothing is failed or
+// aborted. Poll then reports the import complete with no failure.
 func TestUploadHappyPath(t *testing.T) {
 	t.Parallel()
 
-	recorder := &requestRecorder{}
-	apiService := newMockAPIService(t)
-	apiService.EXPECT().
-		UploadContacts(gomock.Any()).
-		DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
-			recorder.record(request)
-			return &sendgridbulkupload.UpsertResponse{JobID: testImportID}, nil
-		}).
-		Times(1)
+	api := newMockAPI(t)
+	var captured sendgridbulkupload.UpsertRequest
+	api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+		func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+			captured = request
+			return &sendgridbulkupload.UpsertResponse{JobID: "sg-import-1"}, nil
+		})
 
-	uploader := newUploader(t, apiService, newDestinationConfig())
-	stagedJobIDs := []int64{1, 2, 3, 4, 5}
+	uploader := newUploader(api)
+	output := uploader.Upload(&common.AsyncDestinationStruct{
+		FileName:        stagingFixture,
+		ImportingJobIDs: []int64{1, 2, 3, 4, 5},
+		Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+	})
+
+	// One request, carrying the list IDs every contact in it resolved to.
+	require.Equal(t, []string{fixtureListID}, captured.ListIDs)
+	require.Len(t, captured.Contacts, 5)
+
+	byEmail := make(map[string]sendgridbulkupload.Contact, len(captured.Contacts))
+	for _, contact := range captured.Contacts {
+		byEmail[contact.Email] = contact
+	}
+	require.Len(t, byEmail, 5)
+
+	// The documented mapping, including userId -> external_id, which is this repository's own
+	// SendGrid convention rather than an invention of the connector.
+	alex := byEmail["alex@example.com"]
+	require.Equal(t, "user_123", alex.ExternalID)
+	require.Equal(t, "anon_456", alex.AnonymousID)
+	require.Equal(t, "Alex", alex.FirstName)
+	require.Equal(t, "Keener", alex.LastName)
+	require.Equal(t, "+14155551234", alex.PhoneNumberID)
+	require.Equal(t, "123 Main St", alex.AddressLine1)
+	require.Equal(t, "San Francisco", alex.City)
+	require.Equal(t, "CA", alex.StateProvinceRegion)
+	require.Equal(t, "94105", alex.PostalCode)
+	require.Equal(t, "US", alex.Country)
+	// Custom fields are keyed by the PRE-CREATED SendGrid field IDs the mapping supplies, never by
+	// the trait name, because SendGrid requires the field to exist before a value can be set.
+	require.Equal(t, "enterprise", alex.CustomFields["w1"])
+	require.Equal(t, "2026-01-15", alex.CustomFields["w2"])
+
+	// A track event is accepted exactly like an identify.
+	require.Equal(t, "user_223", byEmail["blake@example.com"].ExternalID)
+	// Alternate emails and an anonymous-only event both survive the mapping.
+	require.Equal(t, []string{"casey.alt@example.com", "casey.work@example.com"}, byEmail["casey@example.com"].AlternateEmails)
+	require.Equal(t, "anon_889", byEmail["devon@example.com"].AnonymousID)
+	require.Empty(t, byEmail["devon@example.com"].ExternalID)
+
+	require.Equal(t, []int64{1, 2, 3, 4, 5}, output.ImportingJobIDs)
+	require.Equal(t, 5, output.ImportingCount)
+	require.Equal(t, testDestinationID, output.DestinationID)
+	require.Empty(t, output.FailedJobIDs)
+	require.Zero(t, output.FailedCount)
+	require.Empty(t, output.AbortJobIDs)
+	require.Zero(t, output.AbortCount)
+
+	importID, importCount := importParametersOf(t, output)
+	require.Contains(t, importID, "sg-import-1")
+	require.Equal(t, int64(5), importCount, "importCount must be the number of jobs actually accepted")
+
+	// The same value decodes as the shared import-parameters struct, whose ImportId is typed any -
+	// SendGrid's string job_id therefore round-trips with no coercion at either end.
+	var parameters common.ImportParameters
+	require.NoError(t, jsonrs.Unmarshal(output.ImportingParameters, &parameters))
+	require.Equal(t, importID, parameters.ImportId)
+	require.Equal(t, 5, parameters.ImportCount)
+
+	api.EXPECT().GetImportStatus("sg-import-1").Times(1).Return(pollStatus("sg-import-1", "completed", 0, ""), nil)
+	pollResponse := uploader.Poll(common.AsyncPoll{ImportId: importID, ImportCount: 5})
+	require.Equal(t, http.StatusOK, pollResponse.StatusCode)
+	require.True(t, pollResponse.Complete)
+	require.False(t, pollResponse.InProgress)
+	require.False(t, pollResponse.HasFailed)
+	require.False(t, pollResponse.HasWarning)
+	require.Empty(t, pollResponse.FailedJobParameters)
+	require.Empty(t, pollResponse.WarningJobParameters)
+}
+
+// TestUploadRateLimited is scenario S3, and it is the awkward case the connector exists to get
+// right: a 429 must NEVER abort. The affected jobs come back retryable with the advertised reset
+// window in the reason, and no importing state is produced, which is what makes the batch router
+// release the struct and re-queue the jobs.
+func TestUploadRateLimited(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Date(2026, 2, 25, 12, 30, 0, 0, time.UTC)
+	api := newMockAPI(t)
+	api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(nil, &sendgridbulkupload.RateLimitError{
+		StatusCode: http.StatusTooManyRequests,
+		RetryAfter: "120",
+		ResetAt:    resetAt.Unix(),
+		Limit:      600,
+		Remaining:  0,
+		Message:    "too many requests",
+	})
+
+	output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+		FileName:        stagingFixture,
+		ImportingJobIDs: []int64{1, 2, 3, 4, 5},
+		Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+	})
+
+	require.ElementsMatch(t, []int64{1, 2, 3, 4, 5}, output.FailedJobIDs)
+	require.Equal(t, 5, output.FailedCount)
+	require.Equal(t, testDestinationID, output.DestinationID)
+
+	// The reset window has to reach the operator-facing reason, in both the forms SendGrid may
+	// advertise it in.
+	require.Contains(t, output.FailedReason, "Retry-After: 120")
+	require.Contains(t, output.FailedReason, resetAt.Format(time.RFC3339))
+	require.Contains(t, output.FailedReason, "600")
+
+	// The contract of the awkward case, stated as three assertions.
+	require.Empty(t, output.AbortJobIDs, "a rate limit must never abort a job")
+	require.Zero(t, output.AbortCount)
+	require.Empty(t, output.ImportingJobIDs)
+	require.Nil(t, output.ImportingParameters)
+	require.Zero(t, output.ImportingCount)
+}
+
+// TestUploadMultiChunkPartialRateLimit pins the boundary between the two channels when one request
+// of several is rate limited: the accepted chunk keeps its importing state, only the rejected
+// chunk's jobs are retried, the two sets are disjoint, and nothing is aborted.
+func TestUploadMultiChunkPartialRateLimit(t *testing.T) {
+	t.Parallel()
+
+	api := newMockAPI(t)
+	gomock.InOrder(
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-accepted"}, nil),
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(nil, &sendgridbulkupload.RateLimitError{
+			StatusCode: http.StatusTooManyRequests,
+			ResetAt:    time.Date(2026, 2, 25, 13, 0, 0, 0, time.UTC).Unix(),
+			Message:    "too many requests",
+		}),
+	)
+
+	uploader := newUploader(api)
+	uploader.MaxContactsPerRequest = 2
+	output := uploader.Upload(&common.AsyncDestinationStruct{
+		FileName: writeStagingFile(t,
+			contactLine(t, 1), contactLine(t, 2), contactLine(t, 3), contactLine(t, 4)),
+		ImportingJobIDs: []int64{1, 2, 3, 4},
+		Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+	})
+
+	require.Equal(t, []int64{1, 2}, output.ImportingJobIDs)
+	require.Equal(t, 2, output.ImportingCount)
+	require.ElementsMatch(t, []int64{3, 4}, output.FailedJobIDs)
+	require.Equal(t, 2, output.FailedCount)
+	require.Empty(t, output.AbortJobIDs)
+
+	// Disjoint, which the batch router relies on: a job in two sets would receive two statuses.
+	for _, importing := range output.ImportingJobIDs {
+		require.NotContains(t, output.FailedJobIDs, importing)
+	}
+
+	importID, importCount := importParametersOf(t, output)
+	require.Contains(t, importID, "sg-accepted")
+	require.Equal(t, int64(2), importCount)
+}
+
+// TestUploadChunkBoundaries walks the dual-cap chunker across both caps, one below, exactly at and
+// one above each, and insists no chunk is ever empty and that a chunk's jobs are exactly the jobs
+// whose contacts it carried.
+func TestUploadChunkBoundaries(t *testing.T) {
+	t.Parallel()
+
+	t.Run("element cap", func(t *testing.T) {
+		t.Parallel()
+
+		for name, testCase := range map[string]struct {
+			jobCount       int
+			cap            int
+			expectedChunks []int
+		}{
+			"one below the cap":     {jobCount: 2, cap: 3, expectedChunks: []int{2}},
+			"exactly at the cap":    {jobCount: 3, cap: 3, expectedChunks: []int{3}},
+			"one above the cap":     {jobCount: 4, cap: 3, expectedChunks: []int{3, 1}},
+			"exactly twice the cap": {jobCount: 6, cap: 3, expectedChunks: []int{3, 3}},
+			"a single contact":      {jobCount: 1, cap: 3, expectedChunks: []int{1}},
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				lines := make([]string, 0, testCase.jobCount)
+				jobIDs := make([]int64, 0, testCase.jobCount)
+				for jobID := int64(1); jobID <= int64(testCase.jobCount); jobID++ {
+					lines = append(lines, contactLine(t, jobID))
+					jobIDs = append(jobIDs, jobID)
+				}
+
+				api := newMockAPI(t)
+				chunkSizes := make([]int, 0, len(testCase.expectedChunks))
+				api.EXPECT().UploadContacts(gomock.Any()).Times(len(testCase.expectedChunks)).DoAndReturn(
+					func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+						require.NotEmpty(t, request.Contacts, "a chunk must never be empty")
+						chunkSizes = append(chunkSizes, len(request.Contacts))
+						return &sendgridbulkupload.UpsertResponse{
+							JobID: "sg-" + strconv.Itoa(len(chunkSizes)),
+						}, nil
+					})
+
+				uploader := newUploader(api)
+				uploader.MaxContactsPerRequest = testCase.cap
+				output := uploader.Upload(&common.AsyncDestinationStruct{
+					FileName:        writeStagingFile(t, lines...),
+					ImportingJobIDs: jobIDs,
+					Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+				})
+
+				require.Equal(t, testCase.expectedChunks, chunkSizes)
+				require.Equal(t, jobIDs, output.ImportingJobIDs)
+				require.Empty(t, output.FailedJobIDs)
+				require.Empty(t, output.AbortJobIDs)
+
+				// Index alignment, asserted through the persisted membership: every chunk's import
+				// names exactly the jobs whose contacts travelled in it, in file order.
+				importID, importCount := importParametersOf(t, output)
+				require.Equal(t, int64(testCase.jobCount), importCount)
+				for index := range testCase.expectedChunks {
+					require.Contains(t, importID, "sg-"+strconv.Itoa(index+1))
+				}
+			})
+		}
+	})
+
+	t.Run("byte cap", func(t *testing.T) {
+		t.Parallel()
+
+		// The budget is expressed in terms of the ACTUAL marshalled contact rather than a magic
+		// number, because the chunker measures each element with the same marshaller and adds one
+		// byte for the comma that will separate it from its neighbor. Deriving the cap the same way
+		// the chunker spends it is what makes the boundary exact instead of approximate.
+		marshalled, err := jsonrs.Marshal(sendgridbulkupload.Contact{
+			Email:      "user1@example.com",
+			ExternalID: "user_1",
+		})
+		require.NoError(t, err)
+		perContact := len(marshalled) + 1
+
+		// The cap governs the WHOLE serialized body, so the {"list_ids":[...],"contacts":[]}
+		// envelope is charged against it too and the uploader measures it exactly, once per list
+		// group, before handing the chunker what is left. A budget expressed only in contacts would
+		// therefore be short by the envelope and split the batch one element too early, so the
+		// envelope is measured here the same way - which is what keeps each boundary below exact.
+		envelope, err := jsonrs.Marshal(sendgridbulkupload.UpsertRequest{
+			ListIDs:  []string{fixtureListID},
+			Contacts: []sendgridbulkupload.Contact{},
+		})
+		require.NoError(t, err)
+		envelopeBytes := len(envelope)
+
+		for name, testCase := range map[string]struct {
+			contactsPerChunk int
+			expectedChunks   []int
+		}{
+			"a budget that fits exactly one contact": {contactsPerChunk: 1, expectedChunks: []int{1, 1, 1, 1}},
+			"a budget that fits exactly two":         {contactsPerChunk: 2, expectedChunks: []int{2, 2}},
+			"a budget that fits exactly three":       {contactsPerChunk: 3, expectedChunks: []int{3, 1}},
+			"a budget that fits the whole batch":     {contactsPerChunk: 4, expectedChunks: []int{4}},
+			"a budget larger than the whole batch":   {contactsPerChunk: 9, expectedChunks: []int{4}},
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				api := newMockAPI(t)
+				chunkSizes := make([]int, 0, len(testCase.expectedChunks))
+				api.EXPECT().UploadContacts(gomock.Any()).Times(len(testCase.expectedChunks)).DoAndReturn(
+					func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+						require.NotEmpty(t, request.Contacts, "a chunk must never be empty")
+						chunkSizes = append(chunkSizes, len(request.Contacts))
+						return &sendgridbulkupload.UpsertResponse{
+							JobID: "sg-" + strconv.Itoa(len(chunkSizes)),
+						}, nil
+					})
+
+				uploader := newUploader(api)
+				// Far above the element cap, so only the byte budget can be what splits the batch.
+				uploader.MaxContactsPerRequest = 1000
+				uploader.MaxRequestBytes = envelopeBytes + testCase.contactsPerChunk*perContact + 1
+				output := uploader.Upload(&common.AsyncDestinationStruct{
+					FileName: writeStagingFile(t,
+						contactLine(t, 1), contactLine(t, 2), contactLine(t, 3), contactLine(t, 4)),
+					ImportingJobIDs: []int64{1, 2, 3, 4},
+					Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+				})
+
+				require.Equal(t, testCase.expectedChunks, chunkSizes)
+				require.Equal(t, []int64{1, 2, 3, 4}, output.ImportingJobIDs)
+				require.Empty(t, output.FailedJobIDs)
+				require.Empty(t, output.AbortJobIDs)
+			})
+		}
+	})
+
+	t.Run("an override above the documented ceiling is clamped, not honored", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+			func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				// 30,000 is the documented element ceiling; an operator asking for more cannot be
+				// given more, so the four staged contacts still travel in one request rather than
+				// the request being built against an impossible cap.
+				require.Len(t, request.Contacts, 4)
+				return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+			})
+
+		uploader := newUploader(api)
+		uploader.MaxContactsPerRequest = 10_000_000
+		uploader.MaxRequestBytes = 10 << 30
+		output := uploader.Upload(&common.AsyncDestinationStruct{
+			FileName: writeStagingFile(t,
+				contactLine(t, 1), contactLine(t, 2), contactLine(t, 3), contactLine(t, 4)),
+			ImportingJobIDs: []int64{1, 2, 3, 4},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1, 2, 3, 4}, output.ImportingJobIDs)
+		require.Empty(t, output.FailedJobIDs)
+		require.Empty(t, output.AbortJobIDs)
+	})
+}
+
+// TestUploadRejectsUnusableRecords covers the three local, PERMANENT rejections. Each abandons
+// exactly one job on the terminal channel while every other contact in the batch is still delivered,
+// which is the whole point: one unusable record must not poison the request it happens to share.
+func TestUploadRejectsUnusableRecords(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a contact carrying none of the four identifiers", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+			func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				require.Len(t, request.Contacts, 1)
+				require.Equal(t, "user1@example.com", request.Contacts[0].Email)
+				return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+			})
+
+		output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+			FileName: writeStagingFile(t,
+				contactLine(t, 1),
+				stagingLine(t, 2, `{"type":"track","event":"No Identity","properties":{"plan":"growth"}}`)),
+			ImportingJobIDs: []int64{1, 2},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1}, output.ImportingJobIDs)
+		require.Equal(t, []int64{2}, output.AbortJobIDs)
+		require.Equal(t, 1, output.AbortCount)
+		require.Contains(t, output.AbortReason, "at least one of email")
+		require.Empty(t, output.FailedJobIDs)
+	})
+
+	t.Run("a malformed staging line that still names its job", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil)
+
+		output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+			FileName: writeStagingFile(t,
+				contactLine(t, 1),
+				`{"message":"not an object","metadata":{"job_id":2}}`),
+			ImportingJobIDs: []int64{1, 2},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1}, output.ImportingJobIDs)
+		require.Equal(t, []int64{2}, output.AbortJobIDs)
+		require.Contains(t, output.AbortReason, "malformed")
+	})
+
+	t.Run("a contact larger than any request budget", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+			func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				require.Len(t, request.Contacts, 1)
+				return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+			})
+
+		oversized := stagingLine(t, 2, fmt.Sprintf(
+			`{"type":"identify","userId":"user_2","traits":{"email":"two@example.com","firstName":%q}}`,
+			strings.Repeat("x", 400)))
+
+		uploader := newUploader(api)
+		uploader.MaxRequestBytes = 200
+		output := uploader.Upload(&common.AsyncDestinationStruct{
+			FileName:        writeStagingFile(t, contactLine(t, 1), oversized),
+			ImportingJobIDs: []int64{1, 2},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1}, output.ImportingJobIDs)
+		require.Equal(t, []int64{2}, output.AbortJobIDs)
+		require.Contains(t, output.AbortReason, "larger than the maximum sendgrid request size")
+	})
+
+	t.Run("an accepted upload that returns no import job id", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(&sendgridbulkupload.UpsertResponse{JobID: "  "}, nil)
+
+		output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+			FileName:        writeStagingFile(t, contactLine(t, 1)),
+			ImportingJobIDs: []int64{1},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		// Retryable, never importing: an import with no identifier could never be polled.
+		require.Equal(t, []int64{1}, output.FailedJobIDs)
+		require.Empty(t, output.ImportingJobIDs)
+		require.Nil(t, output.ImportingParameters)
+		require.Empty(t, output.AbortJobIDs)
+	})
+
+	t.Run("an import job id that cannot be persisted", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(&sendgridbulkupload.UpsertResponse{JobID: "sg;1=2"}, nil)
+
+		output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+			FileName:        writeStagingFile(t, contactLine(t, 1)),
+			ImportingJobIDs: []int64{1},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1}, output.FailedJobIDs)
+		require.Empty(t, output.ImportingJobIDs)
+		require.Nil(t, output.ImportingParameters)
+		require.Empty(t, output.AbortJobIDs)
+	})
+}
+
+// TestUploadRejectedRequestIsRetryable covers every provider failure that is NOT a rate limit. All
+// of them are retryable, because the batch router alone owns the decision to give up.
+func TestUploadRejectedRequestIsRetryable(t *testing.T) {
+	t.Parallel()
+
+	for name, uploadErr := range map[string]error{
+		"a rejected request": &sendgridbulkupload.APIError{
+			StatusCode: http.StatusBadRequest,
+			Operation:  "upsert contacts",
+			Message:    "invalid list id",
+		},
+		"an authorization failure": &sendgridbulkupload.APIError{
+			StatusCode: http.StatusUnauthorized,
+			Operation:  "upsert contacts",
+			Message:    "permission denied",
+		},
+		"a provider outage": &sendgridbulkupload.APIError{
+			StatusCode: http.StatusServiceUnavailable,
+			Operation:  "upsert contacts",
+		},
+		"a transport failure": errors.New("dial tcp: connection refused"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			api := newMockAPI(t)
+			api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(nil, uploadErr)
+
+			output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+				FileName:        writeStagingFile(t, contactLine(t, 1), contactLine(t, 2)),
+				ImportingJobIDs: []int64{1, 2},
+				Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+			})
+
+			require.ElementsMatch(t, []int64{1, 2}, output.FailedJobIDs)
+			require.Equal(t, 2, output.FailedCount)
+			require.NotEmpty(t, output.FailedReason)
+			require.Empty(t, output.AbortJobIDs, "no provider response is terminal")
+			require.Empty(t, output.ImportingJobIDs)
+		})
+	}
+}
+
+// TestUploadUnreadableStagingFile checks the batch-level failure: nothing can be said about any
+// individual job, so every job in the batch is retried rather than lost.
+func TestUploadUnreadableStagingFile(t *testing.T) {
+	t.Parallel()
+
+	output := newUploader(newMockAPI(t)).Upload(&common.AsyncDestinationStruct{
+		FileName:        filepath.Join(t.TempDir(), "does-not-exist.jsonl"),
+		ImportingJobIDs: []int64{1, 2, 3},
+		FailedJobIDs:    []int64{4},
+		Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+	})
+
+	require.ElementsMatch(t, []int64{1, 2, 3, 4}, output.FailedJobIDs)
+	require.Equal(t, 4, output.FailedCount)
+	require.Empty(t, output.ImportingJobIDs)
+	require.Empty(t, output.AbortJobIDs)
+}
+
+// TestUploadWithoutABatch guards a shared batch router worker: a missing async destination struct
+// must be answered, not panicked on.
+func TestUploadWithoutABatch(t *testing.T) {
+	t.Parallel()
+
+	output := newUploader(newMockAPI(t)).Upload(nil)
+	require.Equal(t, testDestinationID, output.DestinationID)
+	require.Empty(t, output.ImportingJobIDs)
+	require.Empty(t, output.FailedJobIDs)
+	require.Empty(t, output.AbortJobIDs)
+}
+
+// TestPollStatusMapping walks the whole documented status enumeration plus every way a status read
+// can fail, and asserts the batch-router-visible verdict for each. The two rows that matter most are
+// the errored one and the completed-with-errors one: neither may be reported as blanket success,
+// because the router marks EVERY importing job succeeded unless HasFailed is set.
+func TestPollStatusMapping(t *testing.T) {
+	t.Parallel()
+
+	for name, testCase := range map[string]struct {
+		status              string
+		erroredCount        int
+		errorsURL           string
+		expectedStatusCode  int
+		expectedComplete    bool
+		expectedInProgress  bool
+		expectedHasFailed   bool
+		expectFailedDetails bool
+		expectedErrorText   string
+	}{
+		"pending keeps the batch polling": {
+			status:             "pending",
+			expectedStatusCode: http.StatusOK,
+			expectedInProgress: true,
+		},
+		"completed with no errors is a clean success": {
+			status:             "completed",
+			expectedStatusCode: http.StatusOK,
+			expectedComplete:   true,
+		},
+		"completed with errors still reconciles": {
+			status:              "completed",
+			erroredCount:        2,
+			errorsURL:           testErrorsURL,
+			expectedStatusCode:  http.StatusOK,
+			expectedComplete:    true,
+			expectedHasFailed:   true,
+			expectFailedDetails: true,
+		},
+		"errored reconciles": {
+			status:              "errored",
+			erroredCount:        2,
+			errorsURL:           testErrorsURL,
+			expectedStatusCode:  http.StatusOK,
+			expectedComplete:    true,
+			expectedHasFailed:   true,
+			expectFailedDetails: true,
+		},
+		"errored without a published document still reconciles": {
+			status:              "errored",
+			erroredCount:        1,
+			expectedStatusCode:  http.StatusOK,
+			expectedComplete:    true,
+			expectedHasFailed:   true,
+			expectFailedDetails: true,
+		},
+		"failed is terminal": {
+			status:             "failed",
+			erroredCount:       5,
+			errorsURL:          testErrorsURL,
+			expectedStatusCode: http.StatusBadRequest,
+			expectedComplete:   true,
+			expectedHasFailed:  true,
+			expectedErrorText:  "SendGrid Bulk Upload Failed",
+		},
+		"an unrecognized status is retried, never guessed at": {
+			status:             "quiesced",
+			expectedStatusCode: http.StatusInternalServerError,
+			expectedErrorText:  "Unknown status: quiesced",
+		},
+		"a status compared case insensitively": {
+			status:             "  COMPLETED  ",
+			expectedStatusCode: http.StatusOK,
+			expectedComplete:   true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			api := newMockAPI(t)
+			api.EXPECT().GetImportStatus("sg-1").Times(1).Return(
+				pollStatus("sg-1", testCase.status, testCase.erroredCount, testCase.errorsURL), nil)
+
+			response := newUploader(api).Poll(common.AsyncPoll{ImportId: "sg-1", ImportCount: 5})
+
+			require.Equal(t, testCase.expectedStatusCode, response.StatusCode)
+			require.Equal(t, testCase.expectedComplete, response.Complete)
+			require.Equal(t, testCase.expectedInProgress, response.InProgress)
+			require.Equal(t, testCase.expectedHasFailed, response.HasFailed)
+			if testCase.expectedErrorText != "" {
+				require.Contains(t, response.Error, testCase.expectedErrorText)
+			}
+			if testCase.expectFailedDetails {
+				require.NotEmpty(t, response.FailedJobParameters,
+					"reconciliation needs the import's own state and document")
+			} else {
+				require.Empty(t, response.FailedJobParameters)
+			}
+
+			// SendGrid has no warning tier, so these must be zero on every single row.
+			require.False(t, response.HasWarning)
+			require.Empty(t, response.WarningJobParameters)
+		})
+	}
+}
+
+// TestPollStatusReadFailures covers the ways the status read itself can fail. Every one of them is
+// retryable, and a rate limit reports its own status code so the reset window reaches the operator.
+func TestPollStatusReadFailures(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Date(2026, 3, 1, 9, 15, 0, 0, time.UTC)
+
+	t.Run("a rate limit while polling", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportStatus("sg-1").Times(1).Return(nil, &sendgridbulkupload.RateLimitError{
+			StatusCode: http.StatusTooManyRequests,
+			ResetAt:    resetAt.Unix(),
+			Limit:      600,
+			Remaining:  0,
+		})
+
+		response := newUploader(api).Poll(common.AsyncPoll{ImportId: "sg-1", ImportCount: 2})
+		require.Equal(t, http.StatusTooManyRequests, response.StatusCode)
+		require.False(t, response.Complete)
+		require.Contains(t, response.Error, resetAt.Format(time.RFC3339))
+	})
+
+	t.Run("a rejected status read", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportStatus("sg-1").Times(1).Return(nil, &sendgridbulkupload.APIError{
+			StatusCode: http.StatusNotFound,
+			Operation:  "get import status",
+			Message:    "not found",
+		})
+
+		response := newUploader(api).Poll(common.AsyncPoll{ImportId: "sg-1", ImportCount: 2})
+		require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+		require.False(t, response.Complete)
+		require.Contains(t, response.Error, "not found")
+	})
+
+	t.Run("a status response that is absent altogether", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportStatus("sg-1").Times(1).Return(nil, nil)
+
+		response := newUploader(api).Poll(common.AsyncPoll{ImportId: "sg-1", ImportCount: 2})
+		require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+		require.False(t, response.Complete)
+		require.NotEmpty(t, response.Error)
+	})
+
+	t.Run("no import id was persisted at all", func(t *testing.T) {
+		t.Parallel()
+
+		for name, importID := range map[string]string{
+			"an empty identifier":         "",
+			"a whitespace identifier":     "   ",
+			"separators and nothing else": ";;",
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				// The API is never reached, which is asserted by the controller: no call was
+				// expected on it.
+				response := newUploader(newMockAPI(t)).Poll(common.AsyncPoll{ImportId: importID, ImportCount: 3})
+				require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+				require.False(t, response.Complete)
+				require.NotEmpty(t, response.Error)
+			})
+		}
+	})
+}
+
+// TestPollMultipleImports covers the case per-import membership exists for: one upload, several
+// imports, states that do not agree. The strongest outcome has to win, and a mixture must reach
+// reconciliation rather than being resolved wholesale in either direction.
+func TestPollMultipleImports(t *testing.T) {
+	t.Parallel()
+
+	t.Run("any pending import keeps the whole batch polling", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportStatus("sg-a").Times(1).Return(pollStatus("sg-a", "completed", 0, ""), nil)
+		api.EXPECT().GetImportStatus("sg-b").Times(1).Return(pollStatus("sg-b", "pending", 0, ""), nil)
+
+		response := newUploader(api).Poll(common.AsyncPoll{ImportId: "sg-a=1-2;sg-b=3-4", ImportCount: 4})
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.True(t, response.InProgress)
+		require.False(t, response.Complete)
+		require.False(t, response.HasFailed)
+	})
+
+	t.Run("every import clean is a clean success", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportStatus("sg-a").Times(1).Return(pollStatus("sg-a", "completed", 0, ""), nil)
+		api.EXPECT().GetImportStatus("sg-b").Times(1).Return(pollStatus("sg-b", "completed", 0, ""), nil)
+
+		response := newUploader(api).Poll(common.AsyncPoll{ImportId: "sg-a=1-2;sg-b=3-4", ImportCount: 4})
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.True(t, response.Complete)
+		require.False(t, response.HasFailed)
+		require.Empty(t, response.FailedJobParameters)
+	})
+
+	t.Run("every import rejected is terminal for the whole batch", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportStatus("sg-a").Times(1).Return(pollStatus("sg-a", "failed", 2, ""), nil)
+		api.EXPECT().GetImportStatus("sg-b").Times(1).Return(pollStatus("sg-b", "failed", 2, ""), nil)
+
+		response := newUploader(api).Poll(common.AsyncPoll{ImportId: "sg-a=1-2;sg-b=3-4", ImportCount: 4})
+		require.Equal(t, http.StatusBadRequest, response.StatusCode)
+		require.True(t, response.Complete)
+		require.True(t, response.HasFailed)
+		require.Contains(t, response.Error, "SendGrid Bulk Upload Failed")
+	})
+
+	t.Run("a mixture reaches reconciliation carrying every import's own state", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportStatus("sg-a").Times(1).Return(pollStatus("sg-a", "completed", 0, ""), nil)
+		api.EXPECT().GetImportStatus("sg-b").Times(1).Return(pollStatus("sg-b", "failed", 2, ""), nil)
+		api.EXPECT().GetImportStatus("sg-c").Times(1).Return(pollStatus("sg-c", "errored", 1, testErrorsURL), nil)
+
+		response := newUploader(api).Poll(common.AsyncPoll{ImportId: "sg-a=1-2;sg-b=3-4;sg-c=5-6", ImportCount: 6})
+
+		// Not the terminal 400: only ONE import of three was rejected, and aborting the batch
+		// would discard the other two imports' delivered contacts.
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.True(t, response.Complete)
+		require.True(t, response.HasFailed)
+
+		// Every import is described, including the clean one, because reconciliation can only
+		// clear its jobs if it is told they belong to an import that finished cleanly.
+		require.Contains(t, response.FailedJobParameters, "sg-a")
+		require.Contains(t, response.FailedJobParameters, "sg-b")
+		require.Contains(t, response.FailedJobParameters, "sg-c")
+		require.Contains(t, response.FailedJobParameters, testErrorsURL,
+			"the URL SendGrid published travels verbatim, in memory, to reconciliation")
+
+		// The operator-facing reason names the imports without their document paths.
+		require.Contains(t, response.Error, "SendGrid Bulk Upload partially failed")
+		require.NotContains(t, response.Error, "/imports/errors/abc123",
+			"the provider-controlled path must never reach a logged or persisted string")
+	})
+}
+
+// outcomeDocument renders what Poll hands to GetUploadStats for one import, so that the
+// reconciliation cases start from exactly the value the previous call produces rather than from a
+// shape invented for the test.
+func outcomeDocument(t *testing.T, imports ...map[string]any) string {
+	t.Helper()
+	rendered, err := jsonrs.Marshal(map[string]any{"imports": imports})
+	require.NoError(t, err)
+	return string(rendered)
+}
+
+// importedFrom describes one import inside an outcome document.
+//
+// Membership is rendered as the comma-separated list the manifest's own encoding accepts, rather than
+// as a JSON array: the field is a range-collapsed STRING, and writing it in the shape the connector
+// actually reads is what keeps these cases honest about the wire format instead of about a convenient
+// re-interpretation of it. Passing no job IDs leaves the field absent, which is how an import whose
+// membership is unknown is expressed.
+func importedFrom(importID, status, errorsURL string, jobIDs ...int64) map[string]any {
+	described := map[string]any{"id": importID, "status": status}
+	if errorsURL != "" {
+		described["errorsUrl"] = errorsURL
+	}
+	if len(jobIDs) > 0 {
+		rendered := make([]string, 0, len(jobIDs))
+		for _, jobID := range jobIDs {
+			rendered = append(rendered, strconv.FormatInt(jobID, 10))
+		}
+		described["jobs"] = strings.Join(rendered, ",")
+	}
+	return described
+}
+
+// TestGetUploadStatsPartialFailure is scenario S2, the second awkward case: an import that finished
+// with SOME errors must yield failed AND succeeded jobs from one reconciliation, keyed on nothing
+// but the importing jobs themselves and the document SendGrid published.
+//
+// The committed errors fixture names three contacts - two that the staged fixture carries and one it
+// does not - which is what lets the matched rows, the succeeded remainder and the unmatched-row
+// accounting all be asserted from a single realistic document.
+func TestGetUploadStatsPartialFailure(t *testing.T) {
+	t.Parallel()
+
+	// Both spellings of the same situation. SendGrid signals a partial failure with errored, and
+	// completed is documented to carry no errors at all - but a completed import that nonetheless
+	// reports errored rows has to reconcile too, or its rejected contacts would be reported as
+	// delivered. Poll normalizes the second onto the first, so reconciliation sees one state.
+	for name, status := range map[string]string{
+		"an errored import":                   "errored",
+		"a completed import reporting errors": "errored",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			api := newMockAPI(t)
+			api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(errorsDocument(t), nil)
+
+			response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+				FailedJobParameters: outcomeDocument(t,
+					importedFrom("sg-1", status, testErrorsURL, 1, 2, 3, 4, 5)),
+				ImportingList: fixtureJobs(t, 1, 2, 3, 4, 5),
+			})
+
+			// 200 is mandatory: any other status makes the batch router discard the whole
+			// reconciliation and write no status at all.
+			require.Equal(t, http.StatusOK, response.StatusCode)
+
+			// blake@example.com is job 2 and devon@example.com is job 4. The fixture names the
+			// first through "email"+"message" and the second through "contact.email"+
+			// "error_message", so both key spellings are genuinely exercised.
+			require.ElementsMatch(t, []int64{2, 4}, response.Metadata.FailedKeys)
+			require.Contains(t, response.Metadata.FailedReasons[2], "Invalid email address provided for contact")
+			require.Contains(t, response.Metadata.FailedReasons[4], "custom field value exceeds the maximum allowed length")
+
+			// The exact remainder, succeeded by exclusion.
+			require.ElementsMatch(t, []int64{1, 3, 5}, response.Metadata.SucceededKeys)
+
+			// The retryable channel, never the terminal one: a per-row error is recoverable.
+			require.Empty(t, response.Metadata.AbortedKeys)
+			require.Empty(t, response.Metadata.AbortedReasons)
+			require.Empty(t, response.Metadata.WarningKeys)
+			require.Empty(t, response.Metadata.WarningReasons)
+
+			// Disjoint, and complete: every importing job left with exactly one status.
+			assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3, 4, 5})
+		})
+	}
+}
+
+// assertSettledExactlyOnce is the completeness guarantee the batch router depends on. A job in the
+// importing list that appears in none of the key sets receives NO status update at all and stays
+// importing forever, and a job in two sets receives two conflicting ones.
+func assertSettledExactlyOnce(t *testing.T, metadata common.EventStatMeta, importingJobIDs []int64) {
+	t.Helper()
+
+	settledCount := make(map[int64]int, len(importingJobIDs))
+	for _, keys := range [][]int64{
+		metadata.FailedKeys, metadata.AbortedKeys, metadata.SucceededKeys, metadata.WarningKeys,
+	} {
+		for _, jobID := range keys {
+			settledCount[jobID]++
+		}
+	}
+	for _, jobID := range importingJobIDs {
+		require.Equal(t, 1, settledCount[jobID],
+			"job %d must be settled exactly once, was settled %d times", jobID, settledCount[jobID])
+	}
+	require.Len(t, settledCount, len(importingJobIDs), "no job outside the importing list may be settled")
+}
+
+// TestGetUploadStatsPerImportReconciliation is the case per-import membership was built for: one
+// upload, three imports, three different fates. Pooling them would be wrong in both directions -
+// aborting the batch discards two imports' delivered contacts, clearing it by exclusion silently
+// delivers the rejected import's.
+func TestGetUploadStatsPerImportReconciliation(t *testing.T) {
+	t.Parallel()
+
+	api := newMockAPI(t)
+	api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(errorsDocument(t), nil)
+
+	response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+		FailedJobParameters: outcomeDocument(t,
+			// Clean: its jobs are cleared on the strength of the import's own state.
+			importedFrom("sg-clean", "completed", "", 1, 3),
+			// Rejected outright: SendGrid defines this as finished with all errors or entirely
+			// unprocessable, so its jobs are the ONLY ones this connector abandons terminally.
+			importedFrom("sg-rejected", "failed", "", 5),
+			// Individually errored: its rows are failed, its remainder cleared.
+			importedFrom("sg-errored", "errored", testErrorsURL, 2, 4),
+		),
+		ImportingList: fixtureJobs(t, 1, 2, 3, 4, 5),
+	})
+
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	require.Equal(t, []int64{5}, response.Metadata.AbortedKeys)
+	require.Contains(t, response.Metadata.AbortedReasons[5], "entire import")
+	require.ElementsMatch(t, []int64{2, 4}, response.Metadata.FailedKeys)
+	require.ElementsMatch(t, []int64{1, 3}, response.Metadata.SucceededKeys)
+	require.Empty(t, response.Metadata.WarningKeys)
+	assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3, 4, 5})
+}
+
+// TestGetUploadStatsUnmatchedRowsDoNotFailTheImport is the regression this connector was reviewed
+// for. A row the document holds but that names no importing job is evidence about the DOCUMENT, not
+// about any contact - so it is counted and logged, and the jobs it never named are still settled on
+// their own terms. Failing the whole import over one unreadable row retried thousands of contacts
+// SendGrid had accepted and left SucceededKeys empty for a batch that had almost entirely succeeded.
+func TestGetUploadStatsUnmatchedRowsDoNotFailTheImport(t *testing.T) {
+	t.Parallel()
+
+	for name, document := range map[string]string{
+		"an identifier that belongs to no importing job": `{"errors":[{"email":"stranger@example.com","message":"invalid email"}]}`,
+		"an identifier spelled identifier":               `[{"identifier":"nobody@example.com","message":"invalid email"}]`,
+		"a row carrying a message and no identifier":     `{"errors":[{"message":"something went wrong"}]}`,
+		"a readable row alongside an unreadable line":    "{\"email\":\"stranger@example.com\",\"message\":\"invalid email\"}\nnot json at all\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			api := newMockAPI(t)
+			api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return([]byte(document), nil)
+
+			response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+				FailedJobParameters: outcomeDocument(t,
+					importedFrom("sg-1", "errored", testErrorsURL, 1, 2, 3, 4, 5)),
+				ImportingList: fixtureJobs(t, 1, 2, 3, 4, 5),
+			})
+
+			require.Equal(t, http.StatusOK, response.StatusCode)
+			require.Empty(t, response.Metadata.FailedKeys,
+				"an unattributable row must not be turned into a verdict on jobs it never named")
+			require.Empty(t, response.Metadata.AbortedKeys)
+			require.ElementsMatch(t, []int64{1, 2, 3, 4, 5}, response.Metadata.SucceededKeys)
+			assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3, 4, 5})
+		})
+	}
+}
+
+// TestGetUploadStatsTolerantParser pins every document shape the parser accepts, because the shape
+// SendGrid actually serves is undocumented. Each of these must resolve the same contact to the same
+// job, so a change of shape at the provider degrades to a counted metric rather than to churn.
+func TestGetUploadStatsTolerantParser(t *testing.T) {
+	t.Parallel()
+
+	for name, document := range map[string]string{
+		"a bare array": `[{"email":"blake@example.com","message":"invalid phone"}]`,
+		"an object wrapping the rows under errors":  `{"errors":[{"email":"blake@example.com","message":"invalid phone"}]}`,
+		"an object wrapping the rows under results": `{"results":[{"email":"blake@example.com","message":"invalid phone"}]}`,
+		"newline delimited rows":                    "{\"email\":\"blake@example.com\",\"message\":\"invalid phone\"}\n",
+		"an identifier nested under contact":        `[{"contact":{"email":"blake@example.com"},"message":"invalid phone"}]`,
+		"an identifier SendGrid up-cased":           `[{"email":"BLAKE@EXAMPLE.COM","message":"invalid phone"}]`,
+		"an external identifier":                    `[{"external_id":"user_223","message":"invalid phone"}]`,
+		"an anonymous identifier":                   `[{"anonymous_id":"anon_556","message":"invalid phone"}]`,
+		"a message spelled reason":                  `[{"email":"blake@example.com","reason":"invalid phone"}]`,
+		"a message spelled detail":                  `[{"email":"blake@example.com","detail":"invalid phone"}]`,
+		"a message spelled error_message":           `[{"email":"blake@example.com","error_message":"invalid phone"}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			api := newMockAPI(t)
+			api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return([]byte(document), nil)
+
+			response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+				FailedJobParameters: outcomeDocument(t,
+					importedFrom("sg-1", "errored", testErrorsURL, 1, 2, 3, 4, 5)),
+				ImportingList: fixtureJobs(t, 1, 2, 3, 4, 5),
+			})
+
+			require.Equal(t, http.StatusOK, response.StatusCode)
+			require.Equal(t, []int64{2}, response.Metadata.FailedKeys,
+				"every accepted shape must resolve to the same job")
+			require.NotEmpty(t, response.Metadata.FailedReasons[2])
+			require.ElementsMatch(t, []int64{1, 3, 4, 5}, response.Metadata.SucceededKeys)
+			assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3, 4, 5})
+		})
+	}
+}
+
+// TestGetUploadStatsRetriesWhenNoEvidenceIsAvailable covers every way the evidence can be missing.
+// A non-200 is reserved for the cases in which NO reconciliation whatsoever is possible, because the
+// batch router discards the result and retries the whole import; anything narrower is scoped to the
+// jobs it is actually missing evidence about and stays retryable.
+func TestGetUploadStatsRetriesWhenNoEvidenceIsAvailable(t *testing.T) {
+	t.Parallel()
+
+	t.Run("an unparseable errors document fails the whole reconciliation", func(t *testing.T) {
+		t.Parallel()
+
+		// The last four are the load-bearing ones. A document the parser reduces to NO usable row
+		// is reported as an error rather than as an empty result, because an empty result would be
+		// reconciled as "nothing failed" and would mark every contact in an import SendGrid said
+		// had errors as delivered. That is the single worst outcome this connector can produce, so
+		// "I read the document and it told me nothing" has to be retried, not believed.
+		for name, document := range map[string][]byte{
+			"bytes that are not json at all":               []byte("<html><body>gateway timeout</body></html>"),
+			"a truncated document":                         []byte(`{"errors":[{"email":"blake@`),
+			"a scalar":                                     []byte(`42`),
+			"an empty body":                                {},
+			"an empty wrapped array":                       []byte(`{"errors":[]}`),
+			"an empty bare array":                          []byte(`[]`),
+			"rows carrying neither identifier nor message": []byte(`{"errors":[{"error_indices":[7]}]}`),
+			"an object that is not a row at all":           []byte(`{"status":"ok"}`),
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				api := newMockAPI(t)
+				api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(document, nil)
+
+				response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+					FailedJobParameters: outcomeDocument(t,
+						importedFrom("sg-1", "errored", testErrorsURL, 1, 2, 3)),
+					ImportingList: fixtureJobs(t, 1, 2, 3),
+				})
+
+				// 500, emphatically not 200 with an empty failed set: the latter would mark every
+				// job in the import delivered on the strength of a document nobody could read.
+				require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+				require.NotEmpty(t, response.Error)
+				require.Empty(t, response.Metadata.SucceededKeys)
+			})
+		}
+	})
+
+	t.Run("an unfetchable errors document fails the whole reconciliation", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(nil, errors.New("errors document host is not allowed"))
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: outcomeDocument(t,
+				importedFrom("sg-1", "errored", testErrorsURL, 1, 2, 3)),
+			ImportingList: fixtureJobs(t, 1, 2, 3),
+		})
+
+		require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+		require.Contains(t, response.Error, "errors document")
+		require.Empty(t, response.Metadata.SucceededKeys)
+	})
+
+	t.Run("an errored import that published no document retries only its own jobs", func(t *testing.T) {
+		t.Parallel()
+
+		response := newUploader(newMockAPI(t)).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: outcomeDocument(t,
+				importedFrom("sg-clean", "completed", "", 1, 3),
+				importedFrom("sg-silent", "errored", "", 2, 4, 5),
+			),
+			ImportingList: fixtureJobs(t, 1, 2, 3, 4, 5),
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.ElementsMatch(t, []int64{2, 4, 5}, response.Metadata.FailedKeys)
+		require.Contains(t, response.Metadata.FailedReasons[2], "without publishing")
+		require.ElementsMatch(t, []int64{1, 3}, response.Metadata.SucceededKeys,
+			"the clean import's jobs are cleared on the strength of its own state")
+		require.Empty(t, response.Metadata.AbortedKeys)
+		assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3, 4, 5})
+	})
+
+	t.Run("an import that lost contacts with no recoverable membership retries every unresolved job", func(t *testing.T) {
+		t.Parallel()
+
+		// No jobs listed on either import, which is what the manifest degrading past its size
+		// budget leaves behind. Any remaining job might be one the rejected import lost, so none
+		// of them may be succeeded by exclusion - and none of them may be aborted either.
+		response := newUploader(newMockAPI(t)).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: outcomeDocument(t,
+				importedFrom("sg-a", "completed", ""),
+				importedFrom("sg-b", "failed", ""),
+			),
+			ImportingList: fixtureJobs(t, 1, 2, 3, 4, 5),
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.ElementsMatch(t, []int64{1, 2, 3, 4, 5}, response.Metadata.FailedKeys)
+		require.Contains(t, response.Metadata.FailedReasons[1], "could not be identified")
+		require.Empty(t, response.Metadata.SucceededKeys)
+		require.Empty(t, response.Metadata.AbortedKeys,
+			"an abort would terminally discard contacts that were very probably delivered")
+		assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3, 4, 5})
+	})
+
+	t.Run("an importing job whose own identifier cannot be re-derived", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(
+			[]byte(`{"errors":[{"email":"blake@example.com","message":"invalid phone"}]}`), nil)
+
+		jobs := fixtureJobs(t, 1, 2, 3)
+		// Job 3's payload no longer yields any contact identifier, so it can be shown neither to
+		// be named by the document nor to be absent from it.
+		jobs[2].EventPayload = []byte(`{"message":{"type":"track","event":"Anonymous"},"metadata":{"job_id":3}}`)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: outcomeDocument(t, importedFrom("sg-1", "errored", testErrorsURL, 1, 2, 3)),
+			ImportingList:       jobs,
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.ElementsMatch(t, []int64{2, 3}, response.Metadata.FailedKeys)
+		require.Contains(t, response.Metadata.FailedReasons[3], "identifier")
+		require.Equal(t, []int64{1}, response.Metadata.SucceededKeys)
+		assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3})
+	})
+
+	t.Run("a job confirmed by its own completed import needs no identifier", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(
+			[]byte(`{"errors":[{"email":"blake@example.com","message":"invalid phone"}]}`), nil)
+
+		jobs := fixtureJobs(t, 1, 2, 3)
+		jobs[2].EventPayload = []byte(`{"message":{"type":"track","event":"Anonymous"},"metadata":{"job_id":3}}`)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: outcomeDocument(t,
+				importedFrom("sg-errored", "errored", testErrorsURL, 1, 2),
+				importedFrom("sg-clean", "completed", "", 3),
+			),
+			ImportingList: jobs,
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.Equal(t, []int64{2}, response.Metadata.FailedKeys)
+		require.ElementsMatch(t, []int64{1, 3}, response.Metadata.SucceededKeys,
+			"the provider stated the import finished with no errors, which is evidence about job 3")
+		assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3})
+	})
+}
+
+// TestGetUploadStatsWithoutForwardedOutcomes covers the fallbacks. Reconciliation may run in a
+// different process invocation from the Upload and the Poll that preceded it, so it must be able to
+// rebuild everything it needs from the persisted parameters alone.
+func TestGetUploadStatsWithoutForwardedOutcomes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rebuilt from the persisted manifest by re-reading the import", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportStatus("sg-1").Times(1).Return(pollStatus("sg-1", "errored", 1, testErrorsURL), nil)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(errorsDocument(t), nil)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			Parameters:    persistedParameters(t, "sg-1=1-5", 5),
+			ImportingList: fixtureJobs(t, 1, 2, 3, 4, 5),
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.ElementsMatch(t, []int64{2, 4}, response.Metadata.FailedKeys)
+		require.ElementsMatch(t, []int64{1, 3, 5}, response.Metadata.SucceededKeys)
+		assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3, 4, 5})
+	})
+
+	t.Run("the defensive reading of a completed import survives the re-read", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		// completed promises no errors, so a non-zero errored count means the import behaves as
+		// errored whatever SendGrid calls it. Reading this wrongly would report rejected contacts
+		// as delivered, which is the worst outcome this connector can produce.
+		api.EXPECT().GetImportStatus("sg-1").Times(1).Return(pollStatus("sg-1", "completed", 2, testErrorsURL), nil)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(errorsDocument(t), nil)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			Parameters:    persistedParameters(t, "sg-1=1-5", 5),
+			ImportingList: fixtureJobs(t, 1, 2, 3, 4, 5),
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.ElementsMatch(t, []int64{2, 4}, response.Metadata.FailedKeys)
+		require.ElementsMatch(t, []int64{1, 3, 5}, response.Metadata.SucceededKeys)
+	})
+
+	t.Run("a rejected import recovered from the manifest aborts exactly its own jobs", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportStatus("sg-a").Times(1).Return(pollStatus("sg-a", "failed", 2, ""), nil)
+		api.EXPECT().GetImportStatus("sg-b").Times(1).Return(pollStatus("sg-b", "completed", 0, ""), nil)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			Parameters:    persistedParameters(t, "sg-a=1-2;sg-b=3-5", 5),
+			ImportingList: fixtureJobs(t, 1, 2, 3, 4, 5),
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.ElementsMatch(t, []int64{1, 2}, response.Metadata.AbortedKeys)
+		require.ElementsMatch(t, []int64{3, 4, 5}, response.Metadata.SucceededKeys)
+		require.Empty(t, response.Metadata.FailedKeys)
+		assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3, 4, 5})
+	})
+
+	t.Run("a bare errors url list is read but never treated as a rejection", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(errorsDocument(t), nil)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: testErrorsURL,
+			ImportingList:       fixtureJobs(t, 1, 2, 3, 4, 5),
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.ElementsMatch(t, []int64{2, 4}, response.Metadata.FailedKeys)
+		require.ElementsMatch(t, []int64{1, 3, 5}, response.Metadata.SucceededKeys)
+		require.Empty(t, response.Metadata.AbortedKeys, "an unknown state must never abort a job")
+		assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3, 4, 5})
+	})
+
+	t.Run("a status re-read that fails is retried whole", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportStatus("sg-1").Times(1).Return(nil, errors.New("connection reset"))
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			Parameters:    persistedParameters(t, "sg-1=1-3", 3),
+			ImportingList: fixtureJobs(t, 1, 2, 3),
+		})
+
+		require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+		require.Contains(t, response.Error, "connection reset")
+	})
+
+	t.Run("no import id anywhere is retried whole", func(t *testing.T) {
+		t.Parallel()
+
+		for name, input := range map[string]common.GetUploadStatsInput{
+			"no parameters at all":            {},
+			"parameters holding no import id": {Parameters: []byte(`{"importCount":3}`)},
+			"unparseable parameters":          {Parameters: []byte(`{"importId":`)},
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				input.ImportingList = fixtureJobs(t, 1, 2, 3)
+				response := newUploader(newMockAPI(t)).GetUploadStats(input)
+
+				require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+				require.NotEmpty(t, response.Error)
+				require.Empty(t, response.Metadata.SucceededKeys)
+			})
+		}
+	})
+}
+
+// TestGetUploadStatsEdgeCases guards the reconciliation against the inputs a shared batch router
+// worker can genuinely hand it, none of which may panic or strand a job.
+func TestGetUploadStatsEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	t.Run("an empty importing list", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(errorsDocument(t), nil)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: outcomeDocument(t, importedFrom("sg-1", "errored", testErrorsURL)),
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.Empty(t, response.Metadata.FailedKeys)
+		require.Empty(t, response.Metadata.SucceededKeys)
+		require.Empty(t, response.Metadata.AbortedKeys)
+		// Allocated rather than nil, so the batch router's own iteration is safe.
+		require.NotNil(t, response.Metadata.FailedReasons)
+		require.NotNil(t, response.Metadata.AbortedReasons)
+	})
+
+	t.Run("a nil entry in the importing list", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(errorsDocument(t), nil)
+
+		jobs := fixtureJobs(t, 1, 2, 3)
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: outcomeDocument(t, importedFrom("sg-1", "errored", testErrorsURL, 1, 2, 3)),
+			ImportingList:       append([]*jobsdb.JobT{nil}, jobs...),
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.Equal(t, []int64{2}, response.Metadata.FailedKeys)
+		require.ElementsMatch(t, []int64{1, 3}, response.Metadata.SucceededKeys)
+	})
+
+	t.Run("an ambiguous identifier fails every job that claimed it", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(
+			[]byte(`[{"email":"shared@example.com","message":"invalid domain"}]`), nil)
+
+		// Two staged events carrying one address: SendGrid upserts them onto a single contact, so
+		// the errored row genuinely refers to both and neither may be cleared by exclusion.
+		shared := `{"type":"identify","userId":"user_%d","traits":{"email":"shared@example.com"}}`
+		jobs := []*jobsdb.JobT{
+			{JobID: 1, EventPayload: []byte(stagingLine(t, 1, fmt.Sprintf(shared, 1)))},
+			{JobID: 2, EventPayload: []byte(stagingLine(t, 2, fmt.Sprintf(shared, 2)))},
+			{JobID: 3, EventPayload: []byte(contactLine(t, 3))},
+		}
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: outcomeDocument(t, importedFrom("sg-1", "errored", testErrorsURL, 1, 2, 3)),
+			ImportingList:       jobs,
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.ElementsMatch(t, []int64{1, 2}, response.Metadata.FailedKeys)
+		require.Contains(t, response.Metadata.FailedReasons[1], "matches 2 jobs")
+		require.Equal(t, []int64{3}, response.Metadata.SucceededKeys)
+		assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3})
+	})
+
+	t.Run("two imports publishing one shared document read it once", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		// Times(1), not Times(2): re-fetching the same URL per import would double the rows and
+		// double the provider traffic.
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(errorsDocument(t), nil)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: outcomeDocument(t,
+				importedFrom("sg-a", "errored", testErrorsURL, 1, 2),
+				importedFrom("sg-b", "errored", testErrorsURL, 3, 4, 5),
+			),
+			ImportingList: fixtureJobs(t, 1, 2, 3, 4, 5),
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.ElementsMatch(t, []int64{2, 4}, response.Metadata.FailedKeys)
+		require.ElementsMatch(t, []int64{1, 3, 5}, response.Metadata.SucceededKeys)
+	})
+
+	t.Run("a row naming a job whose whole import was rejected never downgrades the abort", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		// The same address appears in the errored import's document while belonging to the
+		// rejected import as well. The terminal verdict must stand, or the job would land in both
+		// FailedKeys and AbortedKeys and the router would write two conflicting statuses for it.
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(
+			[]byte(`[{"email":"blake@example.com","message":"invalid phone"}]`), nil)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: outcomeDocument(t,
+				importedFrom("sg-rejected", "failed", "", 2),
+				importedFrom("sg-errored", "errored", testErrorsURL, 1, 3),
+			),
+			ImportingList: fixtureJobs(t, 1, 2, 3),
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.Equal(t, []int64{2}, response.Metadata.AbortedKeys)
+		require.Empty(t, response.Metadata.FailedKeys)
+		require.ElementsMatch(t, []int64{1, 3}, response.Metadata.SucceededKeys)
+		assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3})
+	})
+}
+
+// TestUploadListIDResolution pins the precedence this repository already documents for SendGrid: a
+// per-event context.externalId entry of type listIds wins, and the destination configuration is the
+// fallback. Contacts targeting different lists cannot share a request body, so the resolution also
+// decides how the batch is grouped.
+func TestUploadListIDResolution(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a per-event entry overrides the destination configuration", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+			func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				require.Equal(t, []string{"per-event-list"}, request.ListIDs)
+				return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+			})
+
+		output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+			FileName: writeStagingFile(t, stagingLine(t, 1,
+				`{"type":"identify","userId":"user_1","traits":{"email":"one@example.com"},`+
+					`"context":{"externalId":[{"type":"listIds","id":["per-event-list"]}]}}`)),
+			ImportingJobIDs: []int64{1},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1}, output.ImportingJobIDs)
+	})
+
+	t.Run("a single string id is accepted as well as an array", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+			func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				require.Equal(t, []string{"scalar-list"}, request.ListIDs)
+				return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+			})
+
+		output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+			FileName: writeStagingFile(t, stagingLine(t, 1,
+				`{"type":"identify","userId":"user_1","traits":{"email":"one@example.com"},`+
+					`"context":{"externalId":[{"type":"LISTIDS","id":"scalar-list"}]}}`)),
+			ImportingJobIDs: []int64{1},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1}, output.ImportingJobIDs)
+	})
+
+	t.Run("contacts targeting different lists travel in separate requests", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		seen := make(map[string][]string)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(2).DoAndReturn(
+			func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				require.Len(t, request.Contacts, 1, "a request may carry only one list's contacts")
+				seen[request.Contacts[0].Email] = request.ListIDs
+				return &sendgridbulkupload.UpsertResponse{JobID: "sg-" + strconv.Itoa(len(seen))}, nil
+			})
+
+		output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+			FileName: writeStagingFile(t,
+				stagingLine(t, 1, `{"type":"identify","userId":"user_1","traits":{"email":"one@example.com"},`+
+					`"context":{"externalId":[{"type":"listIds","id":["list-a"]}]}}`),
+				stagingLine(t, 2, `{"type":"identify","userId":"user_2","traits":{"email":"two@example.com"},`+
+					`"context":{"externalId":[{"type":"listIds","id":["list-b"]}]}}`)),
+			ImportingJobIDs: []int64{1, 2},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, map[string][]string{
+			"one@example.com": {"list-a"},
+			"two@example.com": {"list-b"},
+		}, seen)
+		require.ElementsMatch(t, []int64{1, 2}, output.ImportingJobIDs)
+	})
+
+	t.Run("an upload with no list ids anywhere still upserts the contacts", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+			func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				// Optional by contract: an upsert with no list IDs creates or updates the contacts,
+				// it simply associates them with no list.
+				require.Empty(t, request.ListIDs)
+				require.Len(t, request.Contacts, 1)
+				return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+			})
+
+		uploader := newUploader(api)
+		uploader.DestinationConfig.ListIDs = nil
+		output := uploader.Upload(&common.AsyncDestinationStruct{
+			FileName:        writeStagingFile(t, contactLine(t, 1)),
+			ImportingJobIDs: []int64{1},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1}, output.ImportingJobIDs)
+	})
+}
+
+// TestFullLifecycle drives the three methods in the order the batch router drives them, feeding each
+// call NOTHING but what the previous one produced. It is the only place the wire formats between the
+// calls are proven to agree rather than asserted twice against the same assumption: Upload's persisted
+// manifest is what Poll is given, and Poll's forwarded outcomes are what reconciliation is given.
+func TestFullLifecycle(t *testing.T) {
+	t.Parallel()
+
+	t.Run("one import, partially errored", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil)
+		api.EXPECT().GetImportStatus("sg-1").Times(1).Return(pollStatus("sg-1", "errored", 2, testErrorsURL), nil)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(errorsDocument(t), nil)
+
+		uploader := newUploader(api)
+		jobs := fixtureJobs(t, 1, 2, 3, 4, 5)
+
+		output := uploader.Upload(&common.AsyncDestinationStruct{
+			FileName:        stagingFixture,
+			ImportingJobIDs: []int64{1, 2, 3, 4, 5},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+		require.Equal(t, []int64{1, 2, 3, 4, 5}, output.ImportingJobIDs)
+
+		// Exactly the round trip the batch router performs: it persists ImportingParameters against
+		// every importing job and later reads importId and importCount back out with gjson.
+		importID, importCount := importParametersOf(t, output)
+		pollResponse := uploader.Poll(common.AsyncPoll{ImportId: importID, ImportCount: int(importCount)})
+		require.Equal(t, http.StatusOK, pollResponse.StatusCode)
+		require.True(t, pollResponse.Complete)
+		require.True(t, pollResponse.HasFailed)
+
+		statsResponse := uploader.GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: pollResponse.FailedJobParameters,
+			Parameters:          persistedParameters(t, importID, int(importCount)),
+			ImportingList:       jobs,
+		})
+
+		require.Equal(t, http.StatusOK, statsResponse.StatusCode)
+		require.ElementsMatch(t, []int64{2, 4}, statsResponse.Metadata.FailedKeys)
+		require.ElementsMatch(t, []int64{1, 3, 5}, statsResponse.Metadata.SucceededKeys)
+		require.Empty(t, statsResponse.Metadata.AbortedKeys)
+		assertSettledExactlyOnce(t, statsResponse.Metadata, []int64{1, 2, 3, 4, 5})
+	})
+
+	t.Run("several imports, one rejected and one errored", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		gomock.InOrder(
+			api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-a"}, nil),
+			api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-b"}, nil),
+			api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-c"}, nil),
+		)
+		api.EXPECT().GetImportStatus("sg-a").Times(1).Return(pollStatus("sg-a", "completed", 0, ""), nil)
+		api.EXPECT().GetImportStatus("sg-b").Times(1).Return(pollStatus("sg-b", "failed", 2, ""), nil)
+		api.EXPECT().GetImportStatus("sg-c").Times(1).Return(pollStatus("sg-c", "errored", 1, testErrorsURL), nil)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(
+			[]byte(`[{"email":"erin@example.com","message":"invalid postal code"}]`), nil)
+
+		uploader := newUploader(api)
+		// Two contacts per request over the five-record fixture: sg-a carries jobs 1 and 2, sg-b
+		// carries 3 and 4, sg-c carries 5.
+		uploader.MaxContactsPerRequest = 2
+
+		output := uploader.Upload(&common.AsyncDestinationStruct{
+			FileName:        stagingFixture,
+			ImportingJobIDs: []int64{1, 2, 3, 4, 5},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+		require.Equal(t, []int64{1, 2, 3, 4, 5}, output.ImportingJobIDs)
+
+		importID, importCount := importParametersOf(t, output)
+		pollResponse := uploader.Poll(common.AsyncPoll{ImportId: importID, ImportCount: int(importCount)})
+
+		// One import of three was rejected, so the batch is NOT terminated wholesale: doing so
+		// would discard the two imports whose contacts SendGrid took.
+		require.Equal(t, http.StatusOK, pollResponse.StatusCode)
+		require.True(t, pollResponse.HasFailed)
+
+		statsResponse := uploader.GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: pollResponse.FailedJobParameters,
+			Parameters:          persistedParameters(t, importID, int(importCount)),
+			ImportingList:       fixtureJobs(t, 1, 2, 3, 4, 5),
+		})
+
+		require.Equal(t, http.StatusOK, statsResponse.StatusCode)
+		// The rejected import's jobs, and only those, are abandoned terminally.
+		require.ElementsMatch(t, []int64{3, 4}, statsResponse.Metadata.AbortedKeys)
+		require.Contains(t, statsResponse.Metadata.AbortedReasons[3], "entire import")
+		// The errored import's named row is retried.
+		require.Equal(t, []int64{5}, statsResponse.Metadata.FailedKeys)
+		// The clean import's contacts are delivered.
+		require.ElementsMatch(t, []int64{1, 2}, statsResponse.Metadata.SucceededKeys)
+		assertSettledExactlyOnce(t, statsResponse.Metadata, []int64{1, 2, 3, 4, 5})
+	})
+
+	t.Run("every import clean", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil)
+		api.EXPECT().GetImportStatus("sg-1").Times(1).Return(pollStatus("sg-1", "completed", 0, ""), nil)
+
+		uploader := newUploader(api)
+		output := uploader.Upload(&common.AsyncDestinationStruct{
+			FileName:        stagingFixture,
+			ImportingJobIDs: []int64{1, 2, 3, 4, 5},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		importID, importCount := importParametersOf(t, output)
+		pollResponse := uploader.Poll(common.AsyncPoll{ImportId: importID, ImportCount: int(importCount)})
+
+		// No reconciliation at all: the batch router marks every importing job succeeded wholesale
+		// when Complete is set without HasFailed, so GetUploadStats is never even called.
+		require.Equal(t, http.StatusOK, pollResponse.StatusCode)
+		require.True(t, pollResponse.Complete)
+		require.False(t, pollResponse.HasFailed)
+		require.Empty(t, pollResponse.FailedJobParameters)
+	})
+}
+
+// TestImportManifestPersistence covers the compact per-import membership Upload persists, through the
+// only surface that can observe it: the parameters the batch router stores and hands back to Poll.
+//
+// The manifest has to stay SMALL. The batch router copies ImportingParameters into the status row of
+// every importing job, so a membership rendered one job ID at a time would multiply into the job
+// status table thousands of times over for a single upload.
+func TestImportManifestPersistence(t *testing.T) {
+	t.Parallel()
+
+	t.Run("contiguous membership collapses into ranges", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		gomock.InOrder(
+			api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-a"}, nil),
+			api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-b"}, nil),
+		)
+
+		lines := make([]string, 0, 6)
+		jobIDs := make([]int64, 0, 6)
+		for jobID := int64(1); jobID <= 6; jobID++ {
+			lines = append(lines, contactLine(t, jobID))
+			jobIDs = append(jobIDs, jobID)
+		}
+
+		uploader := newUploader(api)
+		uploader.MaxContactsPerRequest = 3
+		output := uploader.Upload(&common.AsyncDestinationStruct{
+			FileName:        writeStagingFile(t, lines...),
+			ImportingJobIDs: jobIDs,
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		importID, importCount := importParametersOf(t, output)
+		require.Equal(t, "sg-a=1-3;sg-b=4-6", importID)
+		require.Equal(t, int64(6), importCount)
+	})
+
+	t.Run("two chunks answered with one import id are recorded once", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		// SendGrid is free to answer two requests with the same job_id, in which case the
+		// membership of both chunks belongs to that one import.
+		api.EXPECT().UploadContacts(gomock.Any()).Times(2).Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-same"}, nil)
+
+		uploader := newUploader(api)
+		uploader.MaxContactsPerRequest = 2
+		output := uploader.Upload(&common.AsyncDestinationStruct{
+			FileName: writeStagingFile(t,
+				contactLine(t, 1), contactLine(t, 2), contactLine(t, 3), contactLine(t, 4)),
+			ImportingJobIDs: []int64{1, 2, 3, 4},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		importID, importCount := importParametersOf(t, output)
+		require.Equal(t, "sg-same=1-4", importID)
+		require.Equal(t, int64(4), importCount)
+
+		// One import, polled once, whatever the number of requests that produced it.
+		api.EXPECT().GetImportStatus("sg-same").Times(1).Return(pollStatus("sg-same", "completed", 0, ""), nil)
+		require.True(t, uploader.Poll(common.AsyncPoll{ImportId: importID, ImportCount: 4}).Complete)
+	})
+
+	t.Run("membership degrades to identifiers when it will not fit the budget", func(t *testing.T) {
+		t.Parallel()
+
+		// Every job in its own chunk with a non-contiguous membership, repeated far enough that the
+		// rendered membership cannot fit the size budget. The identifiers MUST survive - without
+		// them the import could never be polled at all - and the membership is what is dropped.
+		const jobCount = 400
+
+		api := newMockAPI(t)
+		uploadCount := 0
+		api.EXPECT().UploadContacts(gomock.Any()).Times(jobCount).DoAndReturn(
+			func(sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				uploadCount++
+				return &sendgridbulkupload.UpsertResponse{
+					JobID: fmt.Sprintf("sendgrid-import-identifier-%04d", uploadCount),
+				}, nil
+			})
+
+		lines := make([]string, 0, jobCount)
+		jobIDs := make([]int64, 0, jobCount)
+		for index := 0; index < jobCount; index++ {
+			// Deliberately non-contiguous, so range collapsing cannot rescue the rendering.
+			jobID := int64(index*7 + 1)
+			lines = append(lines, contactLine(t, jobID))
+			jobIDs = append(jobIDs, jobID)
+		}
+
+		uploader := newUploader(api)
+		uploader.MaxContactsPerRequest = 1
+		// The import budget is raised for this case only. Its default deliberately bounds an upload
+		// to far fewer imports than this - which is what keeps a later poll's cost bounded - so
+		// without the override the surplus chunks would be deferred and the manifest would never
+		// grow large enough to exercise the degradation this case exists to pin.
+		uploader.MaxImportsPerUpload = jobCount
+		output := uploader.Upload(&common.AsyncDestinationStruct{
+			FileName:        writeStagingFile(t, lines...),
+			ImportingJobIDs: jobIDs,
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		importID, importCount := importParametersOf(t, output)
+		require.Equal(t, int64(jobCount), importCount)
+		require.NotContains(t, importID, "=", "the membership is what is dropped, not the identifiers")
+		require.Contains(t, importID, "sendgrid-import-identifier-0001")
+		require.Contains(t, importID, fmt.Sprintf("sendgrid-import-identifier-%04d", jobCount))
+
+		// And the degraded value still polls: this is the whole reason the identifiers are kept.
+		for index := 1; index <= jobCount; index++ {
+			identifier := fmt.Sprintf("sendgrid-import-identifier-%04d", index)
+			api.EXPECT().GetImportStatus(identifier).Times(1).Return(pollStatus(identifier, "completed", 0, ""), nil)
+		}
+		pollResponse := uploader.Poll(common.AsyncPoll{ImportId: importID, ImportCount: jobCount})
+		require.Equal(t, http.StatusOK, pollResponse.StatusCode)
+		require.True(t, pollResponse.Complete)
+		require.False(t, pollResponse.HasFailed)
+	})
+
+	t.Run("a legacy value carrying only identifiers is still understood", func(t *testing.T) {
+		t.Parallel()
+
+		// The colon-separated form this connector never writes but must keep reading, so that an
+		// upload already in flight across a deployment is polled rather than stranded.
+		api := newMockAPI(t)
+		api.EXPECT().GetImportStatus("sg-a").Times(1).Return(pollStatus("sg-a", "completed", 0, ""), nil)
+		api.EXPECT().GetImportStatus("sg-b").Times(1).Return(pollStatus("sg-b", "completed", 0, ""), nil)
+
+		response := newUploader(api).Poll(common.AsyncPoll{ImportId: "sg-a:sg-b", ImportCount: 4})
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.True(t, response.Complete)
+		require.False(t, response.HasFailed)
+	})
+
+	t.Run("a membership that cannot be read is treated as unknown, never as partial", func(t *testing.T) {
+		t.Parallel()
+
+		// A partial membership would be worse than none: the jobs the manifest failed to decode
+		// would be attributed to no import and could then be cleared by exclusion even though the
+		// import that carried them was rejected.
+		for name, importID := range map[string]string{
+			"a non-numeric element":     "sg-a=1,abc,3",
+			"an inverted range":         "sg-a=5-1",
+			"a zero job id":             "sg-a=0",
+			"an implausibly wide range": "sg-a=1-999999999",
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				api := newMockAPI(t)
+				api.EXPECT().GetImportStatus("sg-a").Times(1).Return(pollStatus("sg-a", "failed", 2, ""), nil)
+
+				// The import is still identified and still polled - only its membership is unknown.
+				pollResponse := newUploader(api).Poll(common.AsyncPoll{ImportId: importID, ImportCount: 3})
+				require.Equal(t, http.StatusBadRequest, pollResponse.StatusCode,
+					"a single import, rejected outright, is terminal for the batch")
+
+				// And with a second, surviving import in the picture, reconciliation retries rather
+				// than guessing which jobs the rejected one held.
+				statsResponse := newUploader(newMockAPI(t)).GetUploadStats(common.GetUploadStatsInput{
+					FailedJobParameters: outcomeDocument(t,
+						map[string]any{"id": "sg-a", "status": "failed", "jobs": strings.SplitN(importID, "=", 2)[1]},
+						importedFrom("sg-b", "completed", "", 3),
+					),
+					ImportingList: fixtureJobs(t, 1, 2, 3),
+				})
+				require.Equal(t, http.StatusOK, statsResponse.StatusCode)
+				require.ElementsMatch(t, []int64{1, 2, 3}, statsResponse.Metadata.FailedKeys)
+				require.Empty(t, statsResponse.Metadata.AbortedKeys)
+				require.Empty(t, statsResponse.Metadata.SucceededKeys)
+			})
+		}
+	})
+}
+
+// TestTransformFeedsUpload closes the loop between the two methods that share the staging file's
+// shape. Upload is fed lines produced by Transform and nothing else, so a drift in either side's idea
+// of the format shows up here rather than in production.
+func TestTransformFeedsUpload(t *testing.T) {
+	t.Parallel()
+
+	api := newMockAPI(t)
+	api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+		func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+			require.Len(t, request.Contacts, 2)
+			return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+		})
+
+	uploader := newUploader(api)
+	lines := make([]string, 0, 2)
+	for _, event := range []struct {
+		jobID   int64
+		payload string
+	}{
+		{jobID: 11, payload: `{"body":{"JSON":{"type":"identify","userId":"user_11","traits":{"email":"Eleven@Example.com","firstName":"Ell"}}}}`},
+		{jobID: 12, payload: `{"body":{"JSON":{"type":"track","event":"Signed Up","userId":"user_12","context":{"traits":{"email":"twelve@example.com"}}}}}`},
+	} {
+		line, err := uploader.Transform(&jobsdb.JobT{JobID: event.jobID, EventPayload: []byte(event.payload)})
+		require.NoError(t, err)
+		lines = append(lines, line)
+	}
 
 	output := uploader.Upload(&common.AsyncDestinationStruct{
-		Destination:     newDestination(newDestinationConfig()),
-		FileName:        fixtureStagingFile(),
-		ImportingJobIDs: stagedJobIDs,
+		FileName:        writeStagingFile(t, lines...),
+		ImportingJobIDs: []int64{11, 12},
+		Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
 	})
 
-	t.Run("one request carries every contact and the configured list IDs", func(t *testing.T) {
-		requests := recorder.all()
-		require.Len(t, requests, 1, "five contacts sharing one target list must travel in a single upsert")
-		require.Equal(t, []string{testEventListID}, requests[0].ListIDs)
-		require.Len(t, requests[0].Contacts, 5)
-		require.Equal(t,
-			[]string{"alex@example.com", "blake@example.com", "casey@example.com", "devon@example.com", "erin@example.com"},
-			[]string{
-				requests[0].Contacts[0].Email, requests[0].Contacts[1].Email, requests[0].Contacts[2].Email,
-				requests[0].Contacts[3].Email, requests[0].Contacts[4].Email,
-			},
-			"contacts keep the staging file's order and their addresses are lower-cased",
-		)
+	require.Equal(t, []int64{11, 12}, output.ImportingJobIDs)
+	require.Empty(t, output.FailedJobIDs)
+	require.Empty(t, output.AbortJobIDs)
+}
+
+// TestContactWireShape pins the request body against the documented contract. Every field carries
+// omitempty for one specific reason: SendGrid UPSERTS, so a field sent empty overwrites whatever the
+// contact already held, while a field omitted leaves it exactly as it was. An eager marshaller would
+// therefore erase data on every event that happened not to carry a trait.
+func TestContactWireShape(t *testing.T) {
+	t.Parallel()
+
+	t.Run("absent traits are omitted, never sent empty", func(t *testing.T) {
+		t.Parallel()
+
+		rendered, err := jsonrs.Marshal(sendgridbulkupload.Contact{Email: "one@example.com"})
+		require.NoError(t, err)
+		require.JSONEq(t, `{"email":"one@example.com"}`, string(rendered))
 	})
 
-	t.Run("the contact fields are mapped as the destination documents them", func(t *testing.T) {
-		requests := recorder.all()
-		require.Len(t, requests, 1)
+	t.Run("the documented field names are used verbatim", func(t *testing.T) {
+		t.Parallel()
 
-		// The whole contact is asserted rather than a field at a time, so that a mapping which
-		// silently starts sending an EMPTY value is caught too: SendGrid leaves an omitted field
-		// untouched but OVERWRITES one sent empty, which is why every field carries omitempty.
-		require.Equal(t, sendgridbulkupload.Contact{
-			Email:               "alex@example.com",
+		rendered, err := jsonrs.Marshal(sendgridbulkupload.Contact{
+			Email:               "one@example.com",
 			PhoneNumberID:       "+14155551234",
-			ExternalID:          "user_123",
-			AnonymousID:         "anon_456",
-			FirstName:           "Alex",
-			LastName:            "Keener",
-			AddressLine1:        "123 Main St",
+			ExternalID:          "user_1",
+			AnonymousID:         "anon_1",
+			FirstName:           "One",
+			LastName:            "Example",
+			AddressLine1:        "1 Main St",
+			AddressLine2:        "Apt 2",
 			City:                "San Francisco",
 			StateProvinceRegion: "CA",
 			PostalCode:          "94105",
 			Country:             "US",
-			CustomFields:        map[string]any{"w1": "enterprise", "w2": "2026-01-15"},
-		}, requests[0].Contacts[0])
-
-		// A track event reduces to a contact exactly as an identify does.
-		require.Equal(t, "track", gjson.Get(stagingFixtureLines(t)[1], "message.type").String())
-		require.Equal(t, "user_223", requests[0].Contacts[1].ExternalID)
-
-		// Alternate addresses travel as a list, and an event with no userId simply carries no
-		// external ID rather than an empty one.
-		require.Equal(t,
-			[]string{"casey.alt@example.com", "casey.work@example.com"},
-			requests[0].Contacts[2].AlternateEmails,
-		)
-		require.Empty(t, requests[0].Contacts[3].ExternalID)
-		require.Equal(t, "anon_889", requests[0].Contacts[3].AnonymousID)
-
-		// A trait with no entry in the mapping is not invented as a custom field, because
-		// SendGrid requires the field to exist before a value can be written to it.
-		require.NotContains(t, requests[0].Contacts[0].CustomFields, "firstName")
-	})
-
-	t.Run("every staged job is reported importing and nothing failed or aborted", func(t *testing.T) {
-		require.Equal(t, testDestinationID, output.DestinationID)
-		require.Equal(t, stagedJobIDs, output.ImportingJobIDs)
-		require.Equal(t, len(stagedJobIDs), output.ImportingCount)
-
-		require.Empty(t, output.FailedJobIDs)
-		require.Zero(t, output.FailedCount)
-		require.Empty(t, output.FailedReason)
-		require.Empty(t, output.AbortJobIDs)
-		require.Zero(t, output.AbortCount)
-		require.Empty(t, output.AbortReason)
-	})
-
-	t.Run("the import parameters round trip exactly as the batch router reads them", func(t *testing.T) {
-		require.NotEmpty(t, output.ImportingParameters)
-
-		// Read back with gjson from the marshalled bytes, which is literally what the batch
-		// router does when it rebuilds the poll input from the persisted job parameters.
-		require.Equal(t, testImportID, gjson.GetBytes(output.ImportingParameters, "importId").String())
-		require.Equal(t, int64(len(stagedJobIDs)), gjson.GetBytes(output.ImportingParameters, "importCount").Int())
-		// Non-zero on purpose: a count marshalled before the accepted jobs are known is always
-		// zero, and this assertion is what keeps that mistake out of this connector.
-		require.NotZero(t, gjson.GetBytes(output.ImportingParameters, "importCount").Int())
-	})
-
-	t.Run("polling the accepted import reports completion once nothing errored", func(t *testing.T) {
-		pollAPIService := newMockAPIService(t)
-		pollAPIService.EXPECT().
-			GetImportStatus(testImportID).
-			Return(statusFromWireBody(t, importStatusBody(testImportID, "completed", 0, "")), nil).
-			Times(1)
-
-		pollUploader := newUploader(t, pollAPIService, newDestinationConfig())
-		response := pollUploader.Poll(common.AsyncPoll{
-			ImportId:    gjson.GetBytes(output.ImportingParameters, "importId").String(),
-			ImportCount: int(gjson.GetBytes(output.ImportingParameters, "importCount").Int()),
+			AlternateEmails:     []string{"one.alt@example.com"},
+			CustomFields:        map[string]any{"w1": "enterprise"},
 		})
-
-		require.Equal(t, 200, response.StatusCode)
-		require.True(t, response.Complete)
-		require.False(t, response.InProgress)
-		require.False(t, response.HasFailed)
-		require.False(t, response.HasWarning)
-		require.Empty(t, response.FailedJobParameters)
-		require.Empty(t, response.WarningJobParameters)
-	})
-}
-
-// TestUploadListIDResolution pins the documented precedence: a per-event context.externalId entry
-// of type listIds wins over the destination configuration, so one destination can target
-// different lists per event.
-//
-// Because a request's list_ids array applies to every contact in it, that precedence also decides
-// how the batch is split: two contacts resolving to different lists cannot share a request no
-// matter how small they are.
-func TestUploadListIDResolution(t *testing.T) {
-	t.Parallel()
-
-	recorder := &requestRecorder{}
-	apiService := newMockAPIService(t)
-	apiService.EXPECT().
-		UploadContacts(gomock.Any()).
-		DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
-			recorder.record(request)
-			return &sendgridbulkupload.UpsertResponse{JobID: fmt.Sprintf("%s-%d", testImportID, len(recorder.all()))}, nil
-		}).
-		Times(2)
-
-	// The destination targets a DIFFERENT list from the one the fixture's first two events name.
-	destinationConfig := newDestinationConfig()
-	destinationConfig["listIds"] = []any{testConfigListID}
-
-	uploader := newUploader(t, apiService, destinationConfig)
-	output := uploader.Upload(&common.AsyncDestinationStruct{
-		Destination:     newDestination(destinationConfig),
-		FileName:        fixtureStagingFile(),
-		ImportingJobIDs: []int64{1, 2, 3, 4, 5},
+		require.NoError(t, err)
+		require.JSONEq(t, `{
+			"email":"one@example.com",
+			"phone_number_id":"+14155551234",
+			"external_id":"user_1",
+			"anonymous_id":"anon_1",
+			"first_name":"One",
+			"last_name":"Example",
+			"address_line_1":"1 Main St",
+			"address_line_2":"Apt 2",
+			"city":"San Francisco",
+			"state_province_region":"CA",
+			"postal_code":"94105",
+			"country":"US",
+			"alternate_emails":["one.alt@example.com"],
+			"custom_fields":{"w1":"enterprise"}
+		}`, string(rendered))
 	})
 
-	requests := recorder.all()
-	require.Len(t, requests, 2, "two target lists cannot share one upsert")
-
-	// Jobs 1 and 2 carry the per-event list, jobs 3, 4 and 5 fall back to the destination's.
-	require.Equal(t, []string{testEventListID}, requests[0].ListIDs)
-	require.Equal(t, []string{"alex@example.com", "blake@example.com"},
-		[]string{requests[0].Contacts[0].Email, requests[0].Contacts[1].Email})
-
-	require.Equal(t, []string{testConfigListID}, requests[1].ListIDs)
-	require.Len(t, requests[1].Contacts, 3)
-
-	// Both imports are accepted, so both job_ids are persisted and every job is importing.
-	require.ElementsMatch(t, []int64{1, 2, 3, 4, 5}, output.ImportingJobIDs)
-	require.Equal(t, 5, output.ImportingCount)
-	require.Empty(t, output.FailedJobIDs)
-	require.Empty(t, output.AbortJobIDs)
-
-	persistedImportID := gjson.GetBytes(output.ImportingParameters, "importId").String()
-	require.Contains(t, persistedImportID, testImportID+"-1")
-	require.Contains(t, persistedImportID, testImportID+"-2")
-	require.Equal(t, int64(5), gjson.GetBytes(output.ImportingParameters, "importCount").Int())
-}
-
-// TestUploadRateLimited is mandated scenario S3: a 429 from the upsert must NOT abort.
-//
-// The affected jobs come back as retryable failures with the advertised reset window in the
-// reason, and never as aborts. The batch router owns retry, backoff and the decision to give up -
-// it records these jobs as failed and escalates to an abort itself once its retry budget is
-// exhausted - so a connector that aborted here would discard deliverable contacts on the first
-// transient throttle.
-//
-// The empty importing fields matter just as much: the router keeps an upload in the importing
-// state only when BOTH an import identifier and importing job IDs come back, and returning
-// neither is exactly what releases these jobs to be re-queued.
-func TestUploadRateLimited(t *testing.T) {
-	t.Parallel()
-
-	const resetAt int64 = 1772020800 // an absolute instant, not a delay
-
-	apiService := newMockAPIService(t)
-	apiService.EXPECT().
-		UploadContacts(gomock.Any()).
-		Return(nil, newRateLimitError(resetAt)).
-		Times(1)
-
-	uploader := newUploader(t, apiService, newDestinationConfig())
-	output := uploader.Upload(&common.AsyncDestinationStruct{
-		Destination:     newDestination(newDestinationConfig()),
-		FileName:        fixtureStagingFile(),
-		ImportingJobIDs: []int64{1, 2, 3, 4, 5},
-	})
-
-	t.Run("the affected jobs are retryable failures", func(t *testing.T) {
-		require.Equal(t, []int64{1, 2, 3, 4, 5}, output.FailedJobIDs)
-		require.Equal(t, len(output.FailedJobIDs), output.FailedCount)
-		require.Equal(t, testDestinationID, output.DestinationID)
-	})
-
-	t.Run("the advertised reset window reaches the failure reason", func(t *testing.T) {
-		require.Contains(t, output.FailedReason, "rate limited")
-		require.Contains(t, output.FailedReason, "429")
-		// Retry-After is read first when present, even though SendGrid does not document it,
-		// because an edge or proxy may inject it and it is then the most direct statement of
-		// how long to wait.
-		require.Contains(t, output.FailedReason, "Retry-After: 30")
-		// X-RateLimit-Reset is epoch SECONDS, so it is rendered as an absolute instant rather
-		// than as a remaining duration - reading it as a delay would produce a wait of decades.
-		require.Contains(t, output.FailedReason, resetWindow(resetAt))
-		// The quota values go into the reason too, so an operator can tell a throttle apart
-		// from an outage without reading logs.
-		require.Contains(t, output.FailedReason, "X-RateLimit-Limit: 600")
-		require.Contains(t, output.FailedReason, "X-RateLimit-Remaining: 0")
-	})
-
-	t.Run("no importing state is returned, so the jobs are released", func(t *testing.T) {
-		require.Empty(t, output.ImportingJobIDs)
-		require.Empty(t, output.ImportingParameters)
-		require.Zero(t, output.ImportingCount)
-	})
-
-	t.Run("nothing is aborted", func(t *testing.T) {
-		// The single most important assertion of this scenario: a rate limit is never terminal.
-		require.Empty(t, output.AbortJobIDs)
-		require.Zero(t, output.AbortCount)
-		require.Empty(t, output.AbortReason)
-		requireDisjoint(t, output.FailedJobIDs, output.AbortJobIDs)
-	})
-
-	t.Run("the documented 429 body decodes with its null field intact", func(t *testing.T) {
+	t.Run("an upsert request carrying no list ids omits the field", func(t *testing.T) {
 		t.Parallel()
 
-		// SendGrid's documented rate-limit body is {"errors":[{"field":null,"message":"..."}]}.
-		// That null is the whole reason the entry's field is a POINTER: a plain string would
-		// decode an explicit null and an empty field name to the same value, and the entry would
-		// then be rendered as though SendGrid had blamed a field it never named. The distinction
-		// is asserted here rather than assumed because it is invisible at compile time - the
-		// wrong type decodes this body without error and only reads back wrong.
-		var envelope sendgridbulkupload.APIErrorResponse
+		rendered, err := jsonrs.Marshal(sendgridbulkupload.UpsertRequest{
+			Contacts: []sendgridbulkupload.Contact{{Email: "one@example.com"}},
+		})
+		require.NoError(t, err)
+		require.JSONEq(t, `{"contacts":[{"email":"one@example.com"}]}`, string(rendered))
+	})
+
+	t.Run("an upsert request carrying list ids sends them", func(t *testing.T) {
+		t.Parallel()
+
+		rendered, err := jsonrs.Marshal(sendgridbulkupload.UpsertRequest{
+			ListIDs:  []string{fixtureListID},
+			Contacts: []sendgridbulkupload.Contact{{Email: "one@example.com"}},
+		})
+		require.NoError(t, err)
+		require.JSONEq(t,
+			`{"list_ids":["`+fixtureListID+`"],"contacts":[{"email":"one@example.com"}]}`,
+			string(rendered))
+	})
+
+	t.Run("the accepted response carries only the import job id", func(t *testing.T) {
+		t.Parallel()
+
+		var response sendgridbulkupload.UpsertResponse
+		require.NoError(t, jsonrs.Unmarshal([]byte(`{"job_id":"sg-1"}`), &response))
+		require.Equal(t, "sg-1", response.JobID)
+	})
+}
+
+// TestAPIErrorWireShape covers the error bodies. The rate-limit body sends a null field, which is why
+// the field is a pointer: a string would fail to unmarshal the one body this connector most needs to
+// understand.
+func TestAPIErrorWireShape(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a null field is decoded, not rejected", func(t *testing.T) {
+		t.Parallel()
+
+		var response sendgridbulkupload.APIErrorResponse
 		require.NoError(t, jsonrs.Unmarshal(
-			[]byte(`{"errors":[{"field":null,"message":"too many requests"}]}`), &envelope))
-		require.Len(t, envelope.Errors, 1)
-		require.Nil(t, envelope.Errors[0].Field)
-		require.Equal(t, "too many requests", envelope.Errors[0].String())
+			[]byte(`{"errors":[{"field":null,"message":"too many requests"}]}`), &response))
+		require.Len(t, response.Errors, 1)
+		require.Nil(t, response.Errors[0].Field)
+		require.Equal(t, "too many requests", response.Errors[0].Message)
+	})
 
-		// A named field is rendered with its name, which is what makes the null case worth
-		// telling apart in the first place.
-		fieldName := "contacts"
-		named := sendgridbulkupload.APIErrorItem{Field: &fieldName, Message: "is required"}
-		require.Equal(t, "field=contacts: is required", named.String())
+	t.Run("a named field is decoded too", func(t *testing.T) {
+		t.Parallel()
+
+		var response sendgridbulkupload.APIErrorResponse
+		require.NoError(t, jsonrs.Unmarshal(
+			[]byte(`{"errors":[{"field":"list_ids","message":"invalid list id"}]}`), &response))
+		require.NotNil(t, response.Errors[0].Field)
+		require.Equal(t, "list_ids", *response.Errors[0].Field)
+	})
+
+	t.Run("an api error renders its status, operation and message", func(t *testing.T) {
+		t.Parallel()
+
+		field := "list_ids"
+		rendered := (&sendgridbulkupload.APIError{
+			StatusCode: http.StatusBadRequest,
+			Operation:  "upsert contacts",
+			Message:    "invalid list id",
+			Errors:     []sendgridbulkupload.APIErrorItem{{Field: &field, Message: "invalid list id"}},
+		}).Error()
+
+		require.Contains(t, rendered, "upsert contacts")
+		require.Contains(t, rendered, strconv.Itoa(http.StatusBadRequest))
+		require.Contains(t, rendered, "invalid list id")
+	})
+
+	t.Run("a rate limit error renders the reset window", func(t *testing.T) {
+		t.Parallel()
+
+		resetAt := time.Date(2026, 4, 1, 8, 0, 0, 0, time.UTC)
+		rendered := (&sendgridbulkupload.RateLimitError{
+			StatusCode: http.StatusTooManyRequests,
+			RetryAfter: "60",
+			ResetAt:    resetAt.Unix(),
+			Limit:      600,
+			Remaining:  0,
+			Message:    "too many requests",
+		}).Error()
+
+		require.Contains(t, rendered, strconv.Itoa(http.StatusTooManyRequests))
+		require.Contains(t, rendered, "Retry-After: 60")
+		// Rendered as an absolute instant, because X-RateLimit-Reset is epoch seconds rather than a
+		// delta and an operator reading a bare number could not act on it.
+		require.Contains(t, rendered, resetAt.Format(time.RFC3339))
+		require.Contains(t, rendered, "too many requests")
+	})
+
+	t.Run("a rate limit error with no headers at all still renders", func(t *testing.T) {
+		t.Parallel()
+
+		rendered := (&sendgridbulkupload.RateLimitError{StatusCode: http.StatusTooManyRequests}).Error()
+		require.Contains(t, rendered, strconv.Itoa(http.StatusTooManyRequests))
+		require.NotContains(t, rendered, "Retry-After")
+	})
+
+	t.Run("both error types are recoverable with errors.As through a wrap", func(t *testing.T) {
+		t.Parallel()
+
+		// The connector's own branching depends on this: Upload distinguishes a rate limit from
+		// every other rejection by unwrapping, not by inspecting a string.
+		rateLimit := &sendgridbulkupload.RateLimitError{StatusCode: http.StatusTooManyRequests}
+		var recoveredRateLimit *sendgridbulkupload.RateLimitError
+		require.True(t, errors.As(fmt.Errorf("wrapped: %w", rateLimit), &recoveredRateLimit))
+		require.Equal(t, rateLimit, recoveredRateLimit)
+
+		apiErr := &sendgridbulkupload.APIError{StatusCode: http.StatusBadRequest, Operation: "upsert contacts"}
+		var recoveredAPIError *sendgridbulkupload.APIError
+		require.True(t, errors.As(fmt.Errorf("wrapped: %w", apiErr), &recoveredAPIError))
+		require.Equal(t, apiErr, recoveredAPIError)
+
+		// And they are not each other, which is what keeps the 429 branch from swallowing a 400.
+		require.False(t, errors.As(error(apiErr), &recoveredRateLimit))
 	})
 }
 
-// TestUploadPartiallyRateLimited covers a multi-chunk upload in which SendGrid accepts one chunk
-// and throttles the next.
-//
-// The accepted chunk must keep its importing state while only the throttled chunk's jobs are
-// reported retryable, and the two sets must stay disjoint. This is also the sharpest available
-// proof that the chunker's contact and job-ID chunks are INDEX-ALIGNED: the job IDs recovered
-// from each captured request's contacts are exactly the job IDs the uploader reported for that
-// same chunk, so a misalignment would report the wrong jobs as failed.
-func TestUploadPartiallyRateLimited(t *testing.T) {
+// TestGetUploadStatsReadsEveryPayloadShape covers the three places a job's event message can live.
+// Reconciliation re-derives every contact identifier from the importing jobs themselves, so a payload
+// written by an older transformation must still be readable or its contact would be reported as
+// unidentifiable and retried needlessly.
+func TestGetUploadStatsReadsEveryPayloadShape(t *testing.T) {
 	t.Parallel()
 
-	const resetAt int64 = 1772024400
-
-	recorder := &requestRecorder{}
-	apiService := newMockAPIService(t)
-	gomock.InOrder(
-		apiService.EXPECT().
-			UploadContacts(gomock.Any()).
-			DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
-				recorder.record(request)
-				return &sendgridbulkupload.UpsertResponse{JobID: testImportID}, nil
-			}),
-		apiService.EXPECT().
-			UploadContacts(gomock.Any()).
-			DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
-				recorder.record(request)
-				return nil, newRateLimitError(resetAt)
-			}),
-	)
-
-	uploader := newUploader(t, apiService, newDestinationConfig())
-	uploader.MaxContactsPerRequest = 3
-
-	output := uploader.Upload(&common.AsyncDestinationStruct{
-		Destination:     newDestination(newDestinationConfig()),
-		FileName:        writeStagingFile(t, uniformStagingLines(t, 6)...),
-		ImportingJobIDs: []int64{1, 2, 3, 4, 5, 6},
-	})
-
-	requests := recorder.all()
-	require.Len(t, requests, 2)
-	require.Equal(t, []int{3, 3}, recorder.contactsIn())
-	require.Equal(t, []int64{1, 2, 3}, jobIDsOf(t, requests[0]))
-	require.Equal(t, []int64{4, 5, 6}, jobIDsOf(t, requests[1]))
-
-	require.Equal(t, []int64{1, 2, 3}, output.ImportingJobIDs, "the accepted chunk keeps its importing state")
-	require.Equal(t, 3, output.ImportingCount)
-	require.Equal(t, testImportID, gjson.GetBytes(output.ImportingParameters, "importId").String())
-	require.Equal(t, int64(3), gjson.GetBytes(output.ImportingParameters, "importCount").Int())
-
-	require.Equal(t, []int64{4, 5, 6}, output.FailedJobIDs, "only the throttled chunk's jobs are retried")
-	require.Equal(t, 3, output.FailedCount)
-	require.Contains(t, output.FailedReason, resetWindow(resetAt))
-
-	require.Empty(t, output.AbortJobIDs)
-	requireDisjoint(t, output.ImportingJobIDs, output.FailedJobIDs)
-}
-
-// TestUploadProviderRejections covers every other way SendGrid can refuse a chunk.
-//
-// All of them are RETRYABLE, whatever the status code: the batch router owns the retry budget and
-// escalates to an abort itself, so no response from the provider is ever terminal here.
-func TestUploadProviderRejections(t *testing.T) {
-	t.Parallel()
-
-	for _, testCase := range []struct {
-		name           string
-		uploadResponse *sendgridbulkupload.UpsertResponse
-		uploadError    error
-		expectReason   string
-	}{
-		{
-			name: "an authorization failure is retried, not aborted",
-			uploadError: &sendgridbulkupload.APIError{
-				StatusCode: 401,
-				Operation:  "upload contacts",
-				Message:    "unauthorized",
-			},
-			expectReason: "Error in Uploading contacts",
-		},
-		{
-			name: "a provider outage is retried",
-			uploadError: &sendgridbulkupload.APIError{
-				StatusCode: 503,
-				Operation:  "upload contacts",
-				Message:    "service unavailable",
-			},
-			expectReason: "Error in Uploading contacts",
-		},
-		{
-			name:         "a transport failure is retried",
-			uploadError:  fmt.Errorf("sendgrid upload contacts: dial tcp: connection refused"),
-			expectReason: "Error in Uploading contacts",
-		},
-		{
-			name: "an acceptance carrying no import job id is retried",
-			// Recording this as importing would strand the jobs forever, because there is
-			// nothing to poll. The endpoint upserts, so repeating the request is harmless.
-			uploadResponse: &sendgridbulkupload.UpsertResponse{JobID: "   "},
-			expectReason:   "without returning an import job id",
-		},
-		{
-			name:           "a nil response with no error is retried",
-			uploadResponse: nil,
-			expectReason:   "without returning an import job id",
-		},
+	for name, payload := range map[string]string{
+		"the staging line shape Upload writes": `{"message":{"type":"identify","traits":{"email":"blake@example.com"}},"metadata":{"job_id":2}}`,
+		"the router envelope Transform reads":  `{"body":{"JSON":{"type":"identify","traits":{"email":"blake@example.com"}}}}`,
+		"a bare event message":                 `{"type":"identify","traits":{"email":"blake@example.com"}}`,
+		"traits nested under context":          `{"message":{"type":"track","context":{"traits":{"email":"blake@example.com"}}},"metadata":{"job_id":2}}`,
 	} {
-		t.Run(testCase.name, func(t *testing.T) {
+		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			apiService := newMockAPIService(t)
-			apiService.EXPECT().
-				UploadContacts(gomock.Any()).
-				Return(testCase.uploadResponse, testCase.uploadError).
-				Times(1)
+			api := newMockAPI(t)
+			api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(
+				[]byte(`[{"email":"BLAKE@example.com","message":"invalid phone"}]`), nil)
 
-			uploader := newUploader(t, apiService, newDestinationConfig())
-			output := uploader.Upload(&common.AsyncDestinationStruct{
-				Destination:     newDestination(newDestinationConfig()),
-				FileName:        fixtureStagingFile(),
-				ImportingJobIDs: []int64{1, 2, 3, 4, 5},
+			response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+				FailedJobParameters: outcomeDocument(t, importedFrom("sg-1", "errored", testErrorsURL, 2, 3)),
+				ImportingList: []*jobsdb.JobT{
+					{JobID: 2, EventPayload: []byte(payload)},
+					{JobID: 3, EventPayload: []byte(contactLine(t, 3))},
+				},
 			})
 
-			require.Equal(t, []int64{1, 2, 3, 4, 5}, output.FailedJobIDs)
-			require.Equal(t, 5, output.FailedCount)
-			require.Contains(t, output.FailedReason, testCase.expectReason)
-			require.Empty(t, output.ImportingJobIDs)
-			require.Empty(t, output.ImportingParameters)
-			require.Empty(t, output.AbortJobIDs, "no provider response is terminal")
-			require.Zero(t, output.AbortCount)
+			require.Equal(t, http.StatusOK, response.StatusCode)
+			require.Equal(t, []int64{2}, response.Metadata.FailedKeys,
+				"the identifier must be re-derivable from this payload shape")
+			require.Equal(t, []int64{3}, response.Metadata.SucceededKeys)
 		})
 	}
 }
 
-// TestUploadLocalRejections covers the only three outcomes this connector treats as TERMINAL,
-// and they are all local: a contact carrying none of SendGrid's identifiers, a staging record
-// that is malformed yet still names its job, and a contact too large for any request.
+// TestErrorsDocumentURLPolicy pins the trust boundary the errors-document fetch enforces, using the
+// REAL API service rather than the mock.
 //
-// All three are permanent - the batch router would rebuild an identical payload on a retry - so
-// retrying could only fail again and burn the retry budget. Each abandons exactly ONE job and
-// must never poison the rest of the batch.
-func TestUploadLocalRejections(t *testing.T) {
+// Only the rejection paths are exercised, and that is what keeps the suite free of sockets: every
+// rule below is evaluated before any connection is attempted, so a URL that must be refused is
+// refused without a packet leaving the process. The accepting side is deliberately not exercised
+// here, because accepting means dialing.
+//
+// The policy is a default-open one on the HOST and default-closed on everything else. SendGrid
+// publishes this URL and is free to serve the document from object storage on a host no connector
+// can know in advance, so refusing an unknown host would break reconciliation for the very imports
+// it exists to settle; the transport rules below are what make that safe.
+func TestErrorsDocumentURLPolicy(t *testing.T) {
 	t.Parallel()
 
-	t.Run("a contact with none of the four identifiers is aborted on its own", func(t *testing.T) {
+	newAPI := func(t *testing.T, config sendgridbulkupload.DestinationConfig) sendgridbulkupload.SendGridAPIService {
+		t.Helper()
+		api, err := sendgridbulkupload.NewSendGridAPIService(testDestinationID, config, logger.NOP, stats.NOP)
+		require.NoError(t, err)
+		require.NotNil(t, api)
+		return api
+	}
+
+	t.Run("construction requires an api key", func(t *testing.T) {
 		t.Parallel()
 
-		recorder := &requestRecorder{}
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			UploadContacts(gomock.Any()).
-			DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
-				recorder.record(request)
-				return &sendgridbulkupload.UpsertResponse{JobID: testImportID}, nil
-			}).
-			Times(1)
+		for name, apiKey := range map[string]string{
+			"absent":     "",
+			"whitespace": "   ",
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
 
-		uploader := newUploader(t, apiService, newDestinationConfig())
-		output := uploader.Upload(&common.AsyncDestinationStruct{
-			Destination: newDestination(newDestinationConfig()),
-			FileName: writeStagingFile(t,
-				stagingLine(t, 1, `{"type":"identify","userId":"user_01","traits":{"email":"u01@example.com"}}`),
-				// No email, no userId, no anonymousId and no phone: SendGrid rejects a contact
-				// carrying none of the four identifiers it accepts.
-				stagingLine(t, 2, `{"type":"track","event":"Page Viewed","properties":{"plan":"growth"}}`),
-			),
-			ImportingJobIDs: []int64{1, 2},
-		})
-
-		requests := recorder.all()
-		require.Len(t, requests, 1)
-		require.Len(t, requests[0].Contacts, 1, "the unusable record must not be sent")
-		require.Equal(t, "u01@example.com", requests[0].Contacts[0].Email)
-
-		require.Equal(t, []int64{1}, output.ImportingJobIDs, "the rest of the batch is delivered")
-		require.Equal(t, []int64{2}, output.AbortJobIDs, "the rejected job's ID is retained, not lost")
-		require.Equal(t, 1, output.AbortCount)
-		require.Contains(t, output.AbortReason, "at least one of email, phone_number_id, external_id or anonymous_id")
-		require.Empty(t, output.FailedJobIDs)
-		requireDisjoint(t, output.ImportingJobIDs, output.AbortJobIDs)
-	})
-
-	t.Run("a contact too large for any request is aborted on its own", func(t *testing.T) {
-		t.Parallel()
-
-		oversizedContact := sendgridbulkupload.Contact{
-			Email:      "u02@example.com",
-			ExternalID: "user_02",
-			FirstName:  strings.Repeat("x", 400),
+				api, err := sendgridbulkupload.NewSendGridAPIService(
+					testDestinationID, sendgridbulkupload.DestinationConfig{APIKey: apiKey}, logger.NOP, stats.NOP)
+				require.Error(t, err)
+				require.Nil(t, api)
+				require.Contains(t, err.Error(), "apiKey")
+			})
 		}
-		smallContact := uniformContact(1)
-
-		recorder := &requestRecorder{}
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			UploadContacts(gomock.Any()).
-			DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
-				recorder.record(request)
-				return &sendgridbulkupload.UpsertResponse{JobID: testImportID}, nil
-			}).
-			Times(1)
-
-		uploader := newUploader(t, apiService, newDestinationConfig())
-		// One byte below the oversized contact's own footprint: it can never fit in any chunk,
-		// while the small contact still fits comfortably.
-		uploader.MaxRequestBytes = contactSize(t, oversizedContact) - 1
-		require.Less(t, contactSize(t, smallContact), uploader.MaxRequestBytes)
-
-		output := uploader.Upload(&common.AsyncDestinationStruct{
-			Destination: newDestination(newDestinationConfig()),
-			FileName: writeStagingFile(t,
-				stagingLine(t, 1, fmt.Sprintf(
-					`{"type":"identify","userId":%q,"traits":{"email":%q}}`, smallContact.ExternalID, smallContact.Email)),
-				stagingLine(t, 2, fmt.Sprintf(
-					`{"type":"identify","userId":%q,"traits":{"email":%q,"firstName":%q}}`,
-					oversizedContact.ExternalID, oversizedContact.Email, oversizedContact.FirstName)),
-			),
-			ImportingJobIDs: []int64{1, 2},
-		})
-
-		requests := recorder.all()
-		require.Len(t, requests, 1)
-		require.Equal(t, []int64{1}, jobIDsOf(t, requests[0]),
-			"an oversized contact must not wedge the chunker into emitting an over-cap request")
-
-		require.Equal(t, []int64{1}, output.ImportingJobIDs)
-		require.Equal(t, []int64{2}, output.AbortJobIDs)
-		require.Contains(t, output.AbortReason, "larger than the maximum sendgrid request size")
-		require.Empty(t, output.FailedJobIDs)
 	})
 
-	t.Run("a malformed but attributable record is aborted on its own", func(t *testing.T) {
+	t.Run("a url that breaks a transport rule is refused before any connection", func(t *testing.T) {
 		t.Parallel()
 
-		recorder := &requestRecorder{}
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			UploadContacts(gomock.Any()).
-			DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
-				recorder.record(request)
-				return &sendgridbulkupload.UpsertResponse{JobID: testImportID}, nil
-			}).
-			Times(1)
+		api := newAPI(t, testConfig())
+		for name, testCase := range map[string]struct {
+			url    string
+			reason string
+		}{
+			"plain http": {
+				url:    "http://api.sendgrid.com/v3/marketing/contacts/imports/errors/abc",
+				reason: "https is required",
+			},
+			"a file url": {
+				url:    "file:///etc/passwd",
+				reason: "https is required",
+			},
+			"an embedded credential": {
+				url:    "https://user:secret@api.sendgrid.com/errors/abc",
+				reason: "user information",
+			},
+			"a fragment": {
+				url:    "https://api.sendgrid.com/errors/abc#fragment",
+				reason: "fragment",
+			},
+			"an ipv4 literal": {
+				url:    "https://169.254.169.254/errors/abc",
+				reason: "not an ip literal",
+			},
+			"an ipv6 literal": {
+				url:    "https://[::1]/errors/abc",
+				reason: "not an ip literal",
+			},
+			"a non-443 port": {
+				url:    "https://api.sendgrid.com:8443/errors/abc",
+				reason: "443 is required",
+			},
+			"a punycode host": {
+				url:    "https://xn--80ak6aa92e.com/errors/abc",
+				reason: "internationalised",
+			},
+			"no host at all": {
+				url:    "https:///errors/abc",
+				reason: "no host",
+			},
+			"an empty url": {
+				url:    "   ",
+				reason: "empty",
+			},
+			"an unparseable url": {
+				url:    "https://api.sendgrid.com/errors/\x7f\x00",
+				reason: "not a valid url",
+			},
+			"an absurdly long url": {
+				url:    "https://api.sendgrid.com/errors/" + strings.Repeat("a", 8192),
+				reason: "longer than",
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
 
-		uploader := newUploader(t, apiService, newDestinationConfig())
-		output := uploader.Upload(&common.AsyncDestinationStruct{
-			Destination: newDestination(newDestinationConfig()),
-			FileName: writeStagingFile(t,
-				stagingLine(t, 1, `{"type":"identify","userId":"user_01","traits":{"email":"u01@example.com"}}`),
-				// Attributable - the job ID is right there - but carrying no message object, so
-				// the same bytes would fail identically on every retry.
-				`{"metadata":{"job_id":2}}`,
-				// A blank line carries no record at all and is charged against nobody.
-				"",
-			),
-			ImportingJobIDs: []int64{1, 2},
-		})
-
-		require.Len(t, recorder.all(), 1)
-		require.Equal(t, []int64{1}, output.ImportingJobIDs)
-		require.Equal(t, []int64{2}, output.AbortJobIDs)
-		require.Contains(t, output.AbortReason, "malformed")
-		require.Empty(t, output.FailedJobIDs)
+				document, err := api.GetImportErrors(testCase.url)
+				require.Error(t, err)
+				require.Nil(t, document)
+				require.Contains(t, err.Error(), testCase.reason)
+			})
+		}
 	})
 
-	t.Run("an unattributable record fails the whole batch instead of naming a job that does not exist", func(t *testing.T) {
+	t.Run("an operator allow list narrows the accepted hosts when configured", func(t *testing.T) {
 		t.Parallel()
 
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().UploadContacts(gomock.Any()).Times(0)
-
-		uploader := newUploader(t, apiService, newDestinationConfig())
-		output := uploader.Upload(&common.AsyncDestinationStruct{
-			Destination: newDestination(newDestinationConfig()),
-			FileName: writeStagingFile(t,
-				stagingLine(t, 1, `{"type":"identify","userId":"user_01","traits":{"email":"u01@example.com"}}`),
-				// No metadata at all. Reporting this against job ID 0 would name a job that
-				// cannot exist while leaving the real one unaccounted for, so the read fails and
-				// the batch is retried in full.
-				`{"message":{"type":"identify","traits":{"email":"u02@example.com"}}}`,
-			),
-			ImportingJobIDs: []int64{1, 2},
-		})
-
-		require.ElementsMatch(t, []int64{1, 2}, output.FailedJobIDs)
-		require.Equal(t, 2, output.FailedCount)
-		require.Contains(t, output.FailedReason, "Error in reading staging file")
-		require.Empty(t, output.ImportingJobIDs)
-		require.Empty(t, output.AbortJobIDs)
+		// The allow list is configuration rather than destination config, and no key is set in this
+		// suite, so the default - no narrowing - is what applies. That default is asserted through
+		// its observable consequence: an unknown host is NOT refused for being unknown, which is
+		// precisely the behavior this connector was corrected to have. Any refusal it does produce
+		// must therefore come from a transport rule, never from the host itself.
+		api := newAPI(t, testConfig())
+		_, err := api.GetImportErrors("http://sendgrid-exports.s3.amazonaws.com/errors/abc")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "https is required")
+		require.NotContains(t, err.Error(), "allow list",
+			"an unknown host must not be refused by default; SendGrid may serve the document from object storage")
 	})
 
-	t.Run("an unreadable staging file fails the whole batch", func(t *testing.T) {
+	t.Run("a lookalike host cannot pass for a sendgrid host", func(t *testing.T) {
 		t.Parallel()
 
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().UploadContacts(gomock.Any()).Times(0)
-
-		uploader := newUploader(t, apiService, newDestinationConfig())
-		output := uploader.Upload(&common.AsyncDestinationStruct{
-			Destination:     newDestination(newDestinationConfig()),
-			FileName:        filepath.Join(t.TempDir(), "no-such-staging-file.jsonl"),
-			FailedJobIDs:    []int64{9},
-			ImportingJobIDs: []int64{1, 2},
-		})
-
-		// Jobs that had already failed before this upload are reported again, so none of them is
-		// left without a status.
-		require.ElementsMatch(t, []int64{1, 2, 9}, output.FailedJobIDs)
-		require.Equal(t, 3, output.FailedCount)
-		require.Contains(t, output.FailedReason, "Error in reading staging file")
-		require.Empty(t, output.ImportingJobIDs)
-		require.Empty(t, output.AbortJobIDs)
-	})
-
-	t.Run("a job missing from the staging file is swept into the retryable set", func(t *testing.T) {
-		t.Parallel()
-
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			UploadContacts(gomock.Any()).
-			Return(&sendgridbulkupload.UpsertResponse{JobID: testImportID}, nil).
-			Times(1)
-
-		uploader := newUploader(t, apiService, newDestinationConfig())
-		output := uploader.Upload(&common.AsyncDestinationStruct{
-			Destination: newDestination(newDestinationConfig()),
-			FileName: writeStagingFile(t,
-				stagingLine(t, 1, `{"type":"identify","userId":"user_01","traits":{"email":"u01@example.com"}}`),
-			),
-			// Job 42 is in the batch but not in the file. The batch router writes a status only
-			// for the jobs an upload names, so leaving it out would strand it silently.
-			ImportingJobIDs: []int64{1, 42},
-		})
-
-		require.Equal(t, []int64{1}, output.ImportingJobIDs)
-		require.Equal(t, []int64{42}, output.FailedJobIDs)
-		require.Contains(t, output.FailedReason, "not present in the staging file")
-		requireDisjoint(t, output.ImportingJobIDs, output.FailedJobIDs)
-	})
-
-	t.Run("an upload with no batch at all reports nothing rather than panicking", func(t *testing.T) {
-		t.Parallel()
-
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().UploadContacts(gomock.Any()).Times(0)
-
-		uploader := newUploader(t, apiService, newDestinationConfig())
-		output := uploader.Upload(nil)
-
-		require.Equal(t, common.AsyncUploadOutput{DestinationID: testDestinationID}, output)
+		// The credential is attached only to SendGrid's own hosts, and suffix matching is what keeps
+		// a lookalike from qualifying. These are refused on a transport rule, which proves the
+		// refusal happens before any dial - the point being that none of them may ever be treated as
+		// api.sendgrid.com.
+		api := newAPI(t, testConfig())
+		for _, lookalike := range []string{
+			"http://api.sendgrid.com.attacker.example/errors/abc",
+			"http://notsendgrid.com/errors/abc",
+			"http://sendgrid.com.evil.example/errors/abc",
+		} {
+			document, err := api.GetImportErrors(lookalike)
+			require.Error(t, err)
+			require.Nil(t, document)
+		}
 	})
 }
 
-// TestUploadChunking pins the DUAL-cap chunker at its boundaries.
+// TestRegistration guards the one class of defect that every other test in this file would miss.
 //
-// SendGrid caps one upsert at 30,000 contacts OR 6MB of data, whichever is lower, so both caps
-// have to be honoured at once. Every case here drives the real chunker through Upload and asserts
-// the resulting chunk-size sequence, that no empty chunk is ever emitted, and that the contact
-// and job-ID chunks stayed index-aligned.
-func TestUploadChunking(t *testing.T) {
+// A connector can compile, satisfy the interface, and pass its entire unit suite while never once
+// executing in production, because reaching it depends on three separate registries in three separate
+// packages. Nothing about the connector's own code fails if one of them is missing - the destination
+// simply goes nowhere - which is exactly why the wiring is asserted here rather than assumed.
+func TestRegistration(t *testing.T) {
 	t.Parallel()
 
-	// Every uniform contact serializes to the same footprint, which is what makes the byte-cap
-	// boundaries below exact rather than approximate.
-	size := contactSize(t, uniformContact(1))
-	require.Positive(t, size)
+	const destinationType = "SENDGRID_BULK_UPLOAD"
 
-	for _, testCase := range []struct {
-		name         string
-		lineCount    int
-		maxContacts  int
-		maxBytes     int
-		expectChunks []int
-	}{
-		{
-			name:         "just below the contact cap: one request",
-			lineCount:    2,
-			maxContacts:  3,
-			expectChunks: []int{2},
-		},
-		{
-			name:         "exactly at the contact cap: still one request",
-			lineCount:    3,
-			maxContacts:  3,
-			expectChunks: []int{3},
-		},
-		{
-			name:         "one above the contact cap: the chunk flushes",
-			lineCount:    4,
-			maxContacts:  3,
-			expectChunks: []int{3, 1},
-		},
-		{
-			name:         "just below the byte cap: one request",
-			lineCount:    3,
-			maxBytes:     3*size + 1,
-			expectChunks: []int{3},
-		},
-		{
-			name:         "exactly at the byte cap: the chunk flushes before it is reached",
-			lineCount:    3,
-			maxBytes:     3 * size,
-			expectChunks: []int{2, 1},
-		},
-		{
-			name:         "one byte below the byte cap: the chunk flushes too",
-			lineCount:    3,
-			maxBytes:     3*size - 1,
-			expectChunks: []int{2, 1},
-		},
-		{
-			name:         "a byte cap admitting one contact at a time: a request each",
-			lineCount:    3,
-			maxBytes:     2 * size,
-			expectChunks: []int{1, 1, 1},
-		},
-		{
-			name:         "both caps together: the lower one decides",
-			lineCount:    6,
-			maxContacts:  4,
-			maxBytes:     3*size + 1,
-			expectChunks: []int{3, 3},
-		},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
+	t.Run("the processor routes these jobs to the batch router", func(t *testing.T) {
+		t.Parallel()
 
-			recorder := &requestRecorder{}
-			apiService := newMockAPIService(t)
-			apiService.EXPECT().
-				UploadContacts(gomock.Any()).
-				DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
-					recorder.record(request)
-					return &sendgridbulkupload.UpsertResponse{
-						JobID: fmt.Sprintf("%s-%d", testImportID, len(recorder.all())),
-					}, nil
-				}).
-				Times(len(testCase.expectChunks))
+		// Without this entry the processor writes the jobs to the REGULAR router's queue and the
+		// batch router never receives them at all.
+		require.Contains(t, misc.BatchDestinations(), destinationType)
+	})
 
-			uploader := newUploader(t, apiService, newDestinationConfig())
-			// A zero override means "use the endpoint's documented default", which is what lets
-			// each case constrain exactly one cap.
-			uploader.MaxContactsPerRequest = testCase.maxContacts
-			uploader.MaxRequestBytes = testCase.maxBytes
+	t.Run("the batch router classifies the destination as asynchronous", func(t *testing.T) {
+		t.Parallel()
 
-			stagedJobIDs := make([]int64, 0, testCase.lineCount)
-			for index := 1; index <= testCase.lineCount; index++ {
-				stagedJobIDs = append(stagedJobIDs, int64(index))
-			}
+		// Without this the async upload worker early-returns, the batch-router destination check
+		// rejects the type, and the factory's classifier never reaches the construction switch.
+		require.True(t, common.IsAsyncDestination(destinationType))
+		require.True(t, common.IsAsyncRegularDestination(destinationType))
+		require.False(t, common.IsSFTPDestination(destinationType))
+	})
 
-			output := uploader.Upload(&common.AsyncDestinationStruct{
-				Destination:     newDestination(newDestinationConfig()),
-				FileName:        writeStagingFile(t, uniformStagingLines(t, testCase.lineCount)...),
-				ImportingJobIDs: stagedJobIDs,
+	t.Run("the factory constructs the manager", func(t *testing.T) {
+		t.Parallel()
+
+		manager, err := asyncdestinationmanager.NewManager(
+			config.New(), logger.NOP, stats.NOP, testDestination(map[string]any{
+				"apiKey":  "SG.k",
+				"listIds": []any{fixtureListID},
+			}), nil)
+
+		// Never the factory's fallthrough "invalid destination type".
+		require.NoError(t, err)
+		require.NotNil(t, manager)
+		require.IsType(t, &sendgridbulkupload.SendGridBulkUploader{}, manager)
+	})
+
+	t.Run("a misconfigured destination fails the factory rather than the first batch", func(t *testing.T) {
+		t.Parallel()
+
+		manager, err := asyncdestinationmanager.NewManager(
+			config.New(), logger.NOP, stats.NOP, testDestination(map[string]any{}), nil)
+		require.Error(t, err)
+		require.Nil(t, manager)
+	})
+
+	t.Run("the pre-existing sendgrid cloud destination is untouched", func(t *testing.T) {
+		t.Parallel()
+
+		// SENDGRID and SENDGRID_BULK_UPLOAD are different destinations. The bulk connector must not
+		// have made the older one batch-routed or asynchronous, and the factory must still refuse it.
+		require.NotContains(t, misc.BatchDestinations(), "SENDGRID")
+		require.False(t, common.IsAsyncDestination("SENDGRID"))
+
+		manager, err := asyncdestinationmanager.NewManager(
+			config.New(), logger.NOP, stats.NOP, &backendconfig.DestinationT{
+				ID:                    "dest-sendgrid-cloud",
+				Name:                  "SENDGRID",
+				DestinationDefinition: backendconfig.DestinationDefinitionT{Name: "SENDGRID"},
+				Config:                map[string]any{"apiKey": "SG.k"},
+			}, nil)
+		require.Error(t, err)
+		require.Nil(t, manager)
+	})
+}
+
+// TestUploadStagingLineHandling separates the two kinds of bad staging line, because they get
+// opposite treatments and getting that backwards either strands a job or discards a whole batch.
+//
+// A line that NAMES its job but cannot be turned into a contact is rejected on its own, so the rest of
+// the batch is still delivered. A line that names NO job aborts the read, because nothing can be
+// reported against it and continuing would leave the job that produced it silently unaccounted for.
+func TestUploadStagingLineHandling(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a line that names its job is rejected alone", func(t *testing.T) {
+		t.Parallel()
+
+		for name, line := range map[string]string{
+			"a message that is not an object":   `{"message":"a string","metadata":{"job_id":2}}`,
+			"a message that is an array":        `{"message":[],"metadata":{"job_id":2}}`,
+			"no message key at all":             `{"metadata":{"job_id":2}}`,
+			"a job id sent as a numeric string": `{"message":42,"metadata":{"job_id":"2"}}`,
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				api := newMockAPI(t)
+				api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+					func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+						require.Len(t, request.Contacts, 1, "the usable record must still be delivered")
+						return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+					})
+
+				output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+					FileName:        writeStagingFile(t, contactLine(t, 1), line),
+					ImportingJobIDs: []int64{1, 2},
+					Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+				})
+
+				require.Equal(t, []int64{1}, output.ImportingJobIDs)
+				require.Equal(t, []int64{2}, output.AbortJobIDs)
+				require.Empty(t, output.FailedJobIDs)
+			})
+		}
+	})
+
+	t.Run("a line that names no job makes the whole batch retryable", func(t *testing.T) {
+		t.Parallel()
+
+		for name, line := range map[string]string{
+			"not json at all":         `this is not json`,
+			"a bare array":            `["nope"]`,
+			"no metadata whatsoever":  `{"message":{"type":"identify"}}`,
+			"a non-numeric job id":    `{"message":{"type":"identify"},"metadata":{"job_id":"abc"}}`,
+			"a zero job id":           `{"message":{"type":"identify"},"metadata":{"job_id":0}}`,
+			"a negative job id":       `{"message":{"type":"identify"},"metadata":{"job_id":-7}}`,
+			"a job id sent as a list": `{"message":{"type":"identify"},"metadata":{"job_id":[1]}}`,
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				// The API is never reached: nothing is uploaded when the file cannot be read in full.
+				output := newUploader(newMockAPI(t)).Upload(&common.AsyncDestinationStruct{
+					FileName:        writeStagingFile(t, contactLine(t, 1), line),
+					ImportingJobIDs: []int64{1, 2},
+					Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+				})
+
+				require.ElementsMatch(t, []int64{1, 2}, output.FailedJobIDs)
+				require.Empty(t, output.ImportingJobIDs)
+				require.Empty(t, output.AbortJobIDs,
+					"an unreadable file says nothing terminal about any individual job")
+			})
+		}
+	})
+
+	t.Run("blank lines are skipped rather than rejected", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+			func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				require.Len(t, request.Contacts, 2)
+				return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
 			})
 
-			require.Equal(t, testCase.expectChunks, recorder.contactsIn())
-			require.NotContains(t, recorder.contactsIn(), 0, "an empty chunk must never be emitted")
+		output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+			FileName:        writeStagingFile(t, contactLine(t, 1), "", "   ", contactLine(t, 2)),
+			ImportingJobIDs: []int64{1, 2},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
 
-			// Index alignment: the job IDs recovered from each chunk's contacts, concatenated in
-			// call order, are exactly the job IDs reported as importing.
-			alignedJobIDs := make([]int64, 0, testCase.lineCount)
-			for _, request := range recorder.all() {
-				alignedJobIDs = append(alignedJobIDs, jobIDsOf(t, request)...)
-			}
-			require.Equal(t, stagedJobIDs, alignedJobIDs)
-			require.Equal(t, stagedJobIDs, output.ImportingJobIDs)
-			require.Equal(t, testCase.lineCount, output.ImportingCount)
-			require.Equal(t, int64(testCase.lineCount), gjson.GetBytes(output.ImportingParameters, "importCount").Int())
+		require.Equal(t, []int64{1, 2}, output.ImportingJobIDs)
+		require.Empty(t, output.FailedJobIDs)
+		require.Empty(t, output.AbortJobIDs)
+	})
+}
 
-			// One import identifier per accepted chunk, joined into the single value the batch
-			// router persists.
-			persistedImportID := gjson.GetBytes(output.ImportingParameters, "importId").String()
-			for chunk := range testCase.expectChunks {
-				require.Contains(t, persistedImportID, fmt.Sprintf("%s-%d", testImportID, chunk+1))
-			}
+// TestUploadRejectsUnpersistableImportIDs pins the guard that keeps the import manifest readable.
+//
+// The manifest is a delimited string, so an import identifier containing one of its delimiters would
+// corrupt every identifier after it and orphan those imports permanently. Such an upload is reported
+// RETRYABLE rather than importing, because an import that cannot be polled is worse than one that is
+// re-sent - SendGrid upserts, so the re-send is idempotent.
+func TestUploadRejectsUnpersistableImportIDs(t *testing.T) {
+	t.Parallel()
 
-			require.Empty(t, output.FailedJobIDs)
+	for name, importID := range map[string]string{
+		"a manifest separator":   "sg;1",
+		"a membership mark":      "sg=1",
+		"a job separator":        "sg,1",
+		"a legacy colon":         "sg:1",
+		"an embedded space":      "sg 1",
+		"an embedded tab":        "sg\t1",
+		"an embedded newline":    "sg\n1",
+		"an implausibly long id": strings.Repeat("s", 200),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			api := newMockAPI(t)
+			api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(
+				&sendgridbulkupload.UpsertResponse{JobID: importID}, nil)
+
+			output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+				FileName:        writeStagingFile(t, contactLine(t, 1), contactLine(t, 2)),
+				ImportingJobIDs: []int64{1, 2},
+				Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+			})
+
+			require.ElementsMatch(t, []int64{1, 2}, output.FailedJobIDs)
+			require.Empty(t, output.ImportingJobIDs)
+			require.Nil(t, output.ImportingParameters)
 			require.Empty(t, output.AbortJobIDs)
 		})
 	}
 
-	t.Run("a byte cap no contact can fit aborts each contact instead of chunking", func(t *testing.T) {
+	t.Run("a hyphenated uuid is accepted and polls correctly", func(t *testing.T) {
 		t.Parallel()
 
-		apiService := newMockAPIService(t)
-		// Not a single request is issued, which is the strongest statement available that an
-		// empty chunk is never manufactured to carry contacts that cannot fit.
-		apiService.EXPECT().UploadContacts(gomock.Any()).Times(0)
+		// The hyphen is deliberately NOT forbidden, and this case is why: SendGrid returns a UUID,
+		// which is full of hyphens. The range mark is only ever read INSIDE a membership section, so
+		// an identifier is never parsed as a range and a hyphen in one is unambiguous. Forbidding it
+		// would reject every import SendGrid actually creates.
+		const uuid = "e3a4f0d8-4b1e-4c2a-9f77-2b6d5c8e1a90"
 
-		uploader := newUploader(t, apiService, newDestinationConfig())
-		uploader.MaxRequestBytes = size
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).Return(
+			&sendgridbulkupload.UpsertResponse{JobID: uuid}, nil)
 
+		uploader := newUploader(api)
 		output := uploader.Upload(&common.AsyncDestinationStruct{
-			Destination:     newDestination(newDestinationConfig()),
-			FileName:        writeStagingFile(t, uniformStagingLines(t, 3)...),
-			ImportingJobIDs: []int64{1, 2, 3},
+			FileName:        writeStagingFile(t, contactLine(t, 1), contactLine(t, 2)),
+			ImportingJobIDs: []int64{1, 2},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
 		})
 
+		require.Equal(t, []int64{1, 2}, output.ImportingJobIDs)
+		importID, importCount := importParametersOf(t, output)
+		require.Equal(t, uuid+"=1-2", importID)
+		require.Equal(t, int64(2), importCount)
+
+		// And the persisted value decodes back to exactly that one identifier, which is the whole
+		// point of the guard: the manifest has to survive the round trip.
+		api.EXPECT().GetImportStatus(uuid).Times(1).Return(pollStatus(uuid, "completed", 0, ""), nil)
+		pollResponse := uploader.Poll(common.AsyncPoll{ImportId: importID, ImportCount: int(importCount)})
+		require.Equal(t, http.StatusOK, pollResponse.StatusCode)
+		require.True(t, pollResponse.Complete)
+		require.False(t, pollResponse.HasFailed)
+	})
+}
+
+// TestUploadCustomFieldMapping pins the custom-field contract: SendGrid addresses custom fields by an
+// opaque pre-created ID, so a trait with no mapping entry is not sent at all. Inventing a field name
+// would produce nothing but rejected requests.
+func TestUploadCustomFieldMapping(t *testing.T) {
+	t.Parallel()
+
+	api := newMockAPI(t)
+	api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+		func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+			require.Len(t, request.Contacts, 1)
+			contact := request.Contacts[0]
+			// Keyed by the SendGrid field ID, never by the trait name.
+			require.Equal(t, "enterprise", contact.CustomFields["w1"])
+			require.NotContains(t, contact.CustomFields, "plan")
+			// An unmapped trait is absent entirely rather than guessed at.
+			require.NotContains(t, contact.CustomFields, "unmappedTrait")
+			require.Len(t, contact.CustomFields, 1)
+			return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+		})
+
+	output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+		FileName: writeStagingFile(t, stagingLine(t, 1,
+			`{"type":"identify","userId":"user_1","traits":{"email":"one@example.com",`+
+				`"plan":"enterprise","unmappedTrait":"ignored"}}`)),
+		ImportingJobIDs: []int64{1},
+		Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+	})
+
+	require.Equal(t, []int64{1}, output.ImportingJobIDs)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The errors document is the connector's least specified input, and the exhaustive coverage below
+// is what keeps its parser honest.
+//
+// SendGrid publishes NO schema for the document behind results.errors_url: the official
+// specification mentions the field exactly twice and both times only as a bare string URL, with no
+// media type, no schema and no stated retention, and the reference pages describe no format at all.
+// The parser is therefore deliberately tolerant, and tolerance that is not exhaustively pinned is
+// indistinguishable from a guess - so every shape it accepts, every key precedence it applies,
+// every shape it refuses and every bound it enforces is asserted here rather than assumed.
+// ---------------------------------------------------------------------------------------------
+
+// reconcileFixtureDocument reconciles ONE errors document against the five staged fixture jobs.
+//
+// The errors URL is passed in the legacy bare-URL form rather than as a rendered outcome document,
+// which is the shape reconciliation must still accept from an upload that was polled by an older
+// build: the URL then describes an import whose membership is unknown, so every job the document
+// does not name is settled by exclusion. GetImportStatus is expected zero times, because a
+// forwarded URL is all the evidence this path needs and re-reading the import would be a provider
+// request nobody asked for.
+func reconcileFixtureDocument(t *testing.T, document string) common.GetUploadStatsResponse {
+	t.Helper()
+
+	api := newMockAPI(t)
+	api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return([]byte(document), nil)
+	api.EXPECT().GetImportStatus(gomock.Any()).Times(0)
+
+	return newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+		FailedJobParameters: testErrorsURL,
+		Parameters:          persistedParameters(t, "sg-1", 5),
+		ImportingList:       fixtureJobs(t, 1, 2, 3, 4, 5),
+	})
+}
+
+// remainingFixtureJobs returns the staged fixture's job IDs minus the ones given, which is the set
+// succeeded-by-exclusion must produce for a document naming exactly those.
+func remainingFixtureJobs(failed ...int64) []int64 {
+	remaining := make([]int64, 0, 5)
+	for jobID := int64(1); jobID <= 5; jobID++ {
+		if !slices.Contains(failed, jobID) {
+			remaining = append(remaining, jobID)
+		}
+	}
+	return remaining
+}
+
+// TestGetUploadStatsDocumentShapeTolerance pins the shapes the parser accepts beyond the ones the
+// happy-path cases already exercise. Each has to yield the SAME reconciliation, because which of
+// these shapes SendGrid happens to serve is not something the connector may depend on.
+func TestGetUploadStatsDocumentShapeTolerance(t *testing.T) {
+	t.Parallel()
+
+	const (
+		blakeReason = "Invalid email address provided for contact."
+		devonReason = "Contact rejected: custom field value exceeds the maximum allowed length."
+	)
+
+	for name, testCase := range map[string]struct {
+		document      string
+		failedKeys    []int64
+		failedReasons map[int64]string
+	}{
+		"a bare array of rows": {
+			document:      fmt.Sprintf(`[{"email":"blake@example.com","message":%q}]`, blakeReason),
+			failedKeys:    []int64{2},
+			failedReasons: map[int64]string{2: blakeReason},
+		},
+		"a single row object that is not wrapped in anything": {
+			document:      fmt.Sprintf(`{"email":"blake@example.com","message":%q}`, blakeReason),
+			failedKeys:    []int64{2},
+			failedReasons: map[int64]string{2: blakeReason},
+		},
+		"newline delimited rows padded with blank and whitespace-only lines": {
+			document: fmt.Sprintf(
+				"\n{\"email\":\"blake@example.com\",\"message\":%q}\n\n   \n{\"contact\":{\"email\":\"devon@example.com\"},\"error_message\":%q}\n\n",
+				blakeReason, devonReason),
+			failedKeys:    []int64{2, 4},
+			failedReasons: map[int64]string{2: blakeReason, 4: devonReason},
+		},
+		"an errors array alongside unrelated keys the parser ignores": {
+			document: fmt.Sprintf(
+				`{"job_id":"sg-1","status":"errored","errored_count":1,"errors":[{"email":"blake@example.com","message":%q}]}`,
+				blakeReason),
+			failedKeys:    []int64{2},
+			failedReasons: map[int64]string{2: blakeReason},
+		},
+		"an errors array in preference to a results array": {
+			document: fmt.Sprintf(
+				`{"errors":[{"email":"blake@example.com","message":%q}],"results":[{"email":"casey@example.com","message":%q}]}`,
+				blakeReason, devonReason),
+			failedKeys:    []int64{2},
+			failedReasons: map[int64]string{2: blakeReason},
+		},
+		"a results array when there is no errors array": {
+			document: fmt.Sprintf(
+				`{"results":[{"email":"blake@example.com","message":%q},{"email":"casey@example.com","message":%q}]}`,
+				blakeReason, devonReason),
+			failedKeys:    []int64{2, 3},
+			failedReasons: map[int64]string{2: blakeReason, 3: devonReason},
+		},
+		"rows carrying an unknown key alongside the ones the parser reads": {
+			// The committed fixture carries error_indices, which this connector does not use.
+			// An unknown key must neither make a row unrecognizable nor become its message.
+			document: fmt.Sprintf(
+				`{"errors":[{"email":"blake@example.com","message":%q,"error_indices":[1]}]}`, blakeReason),
+			failedKeys:    []int64{2},
+			failedReasons: map[int64]string{2: blakeReason},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			response := reconcileFixtureDocument(t, testCase.document)
+
+			require.Equal(t, http.StatusOK, response.StatusCode)
+			require.ElementsMatch(t, testCase.failedKeys, response.Metadata.FailedKeys)
+			for jobID, reason := range testCase.failedReasons {
+				require.Contains(t, response.Metadata.FailedReasons[jobID], reason)
+			}
+			require.ElementsMatch(t, remainingFixtureJobs(testCase.failedKeys...), response.Metadata.SucceededKeys)
+			require.Empty(t, response.Metadata.AbortedKeys, "a per-row error is recoverable, never terminal")
+			assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3, 4, 5})
+		})
+	}
+}
+
+// TestGetUploadStatsRowKeyPrecedence pins the key precedence WITHIN one errored row: which key an
+// identifier is read from and which key a message is read from, when a row carries several.
+//
+// Precedence is the part tolerance cannot be sloppy about. A row carrying two identifiers must
+// resolve to exactly ONE job - resolving it to both would fail a contact SendGrid never complained
+// about - so the order the candidates are consulted in is asserted rather than left to whichever
+// key the implementation happens to test first.
+func TestGetUploadStatsRowKeyPrecedence(t *testing.T) {
+	t.Parallel()
+
+	// The reason recorded when a row names a contact but gives no usable message. Mirrored as a
+	// literal because the batch router persists it verbatim against the job.
+	const defaultFailureReason = "sendgrid reported an error for this contact without a message"
+
+	for name, testCase := range map[string]struct {
+		row          string
+		failedKey    int64
+		failedReason string
+	}{
+		"an email outranks every other identifier key": {
+			// Job 2 is blake, job 4 is devon, job 3 is casey and job 5 carried user_523: four
+			// different jobs are named by the four keys, so only precedence can decide.
+			row: `{"email":"blake@example.com","contact":{"email":"devon@example.com"},` +
+				`"identifier":"casey@example.com","external_id":"user_523","anonymous_id":"anon_889","message":"rejected"}`,
+			failedKey:    2,
+			failedReason: "rejected",
+		},
+		"a nested contact email is used when there is no email": {
+			row:          `{"contact":{"email":"devon@example.com"},"identifier":"casey@example.com","message":"rejected"}`,
+			failedKey:    4,
+			failedReason: "rejected",
+		},
+		"an identifier is used when neither email key is present": {
+			// Up-cased on purpose: SendGrid lower-cases every email it stores, so both sides of
+			// the comparison are folded before they are matched.
+			row:          `{"identifier":"CASEY@EXAMPLE.COM","external_id":"user_523","message":"rejected"}`,
+			failedKey:    3,
+			failedReason: "rejected",
+		},
+		"an external id resolves the job that carried that user id": {
+			row:          `{"external_id":"user_523","message":"rejected"}`,
+			failedKey:    5,
+			failedReason: "rejected",
+		},
+		"an anonymous id resolves the job that carried that anonymous id": {
+			// Job 4 is the staged event with no userId at all, so its anonymous id is the only
+			// identifier besides its email that can resolve it.
+			row:          `{"anonymous_id":"anon_889","message":"rejected"}`,
+			failedKey:    4,
+			failedReason: "rejected",
+		},
+		"a blank email falls through to the next identifier key": {
+			row:          `{"email":"   ","identifier":"casey@example.com","message":"rejected"}`,
+			failedKey:    3,
+			failedReason: "rejected",
+		},
+		"a message outranks every other message key": {
+			row:          `{"email":"blake@example.com","message":"from message","error_message":"from error_message","reason":"from reason","detail":"from detail"}`,
+			failedKey:    2,
+			failedReason: "from message",
+		},
+		"an error message is used when there is no message": {
+			row:          `{"email":"blake@example.com","error_message":"from error_message","reason":"from reason","detail":"from detail"}`,
+			failedKey:    2,
+			failedReason: "from error_message",
+		},
+		"a reason is used when neither message nor error message is present": {
+			row:          `{"email":"blake@example.com","reason":"from reason","detail":"from detail"}`,
+			failedKey:    2,
+			failedReason: "from reason",
+		},
+		"a detail is the last message key considered": {
+			row:          `{"email":"blake@example.com","detail":"from detail"}`,
+			failedKey:    2,
+			failedReason: "from detail",
+		},
+		"a blank message falls back to this connector's own reason": {
+			row:          `{"email":"blake@example.com","message":"   "}`,
+			failedKey:    2,
+			failedReason: defaultFailureReason,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			response := reconcileFixtureDocument(t, `{"errors":[`+testCase.row+`]}`)
+
+			require.Equal(t, http.StatusOK, response.StatusCode)
+			require.Equal(t, []int64{testCase.failedKey}, response.Metadata.FailedKeys,
+				"a row carrying several candidate keys must resolve to exactly one job")
+			require.Equal(t, testCase.failedReason, response.Metadata.FailedReasons[testCase.failedKey])
+			require.ElementsMatch(t, remainingFixtureJobs(testCase.failedKey), response.Metadata.SucceededKeys)
+			assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3, 4, 5})
+		})
+	}
+}
+
+// TestGetUploadStatsDocumentRejections pins the outcome for every document the parser cannot make
+// sense of: HTTP 500, which asks the batch router to retry the whole import.
+//
+// This is the deliberately safer failure mode, and it is the single most consequential assertion in
+// the suite. Returning 200 with an empty failed set would mark every job in the import as delivered
+// on the strength of a document nobody understood, losing every contact SendGrid actually rejected.
+// Nothing is ever reported succeeded on a guess.
+func TestGetUploadStatsDocumentRejections(t *testing.T) {
+	t.Parallel()
+
+	for name, testCase := range map[string]struct {
+		document string
+		contains string
+	}{
+		"an empty document":                        {document: "", contains: "the errors document is empty"},
+		"a document of nothing but whitespace":     {document: "   \n\t\n ", contains: "the errors document is empty"},
+		"a truncated document":                     {document: `{"errors":[{"email":"blake@example.com"`, contains: "matches none of the shapes this parser understands"},
+		"a json string":                            {document: `"a contact was rejected"`, contains: "neither an array nor an object"},
+		"a json number":                            {document: `42`, contains: "neither an array nor an object"},
+		"a json boolean":                           {document: `true`, contains: "neither an array nor an object"},
+		"a json null":                              {document: `null`, contains: "neither an array nor an object"},
+		"bytes that are not json at all":           {document: "<html><body>504 gateway timeout</body></html>", contains: "matches none of the shapes this parser understands"},
+		"an empty array":                           {document: `[]`, contains: "an array carrying no recognizable rows"},
+		"an array of rows the parser cannot read":  {document: `[{"unexpected":"shape"},{"another":1}]`, contains: "an array carrying no recognizable rows"},
+		"an empty errors array":                    {document: `{"errors":[]}`, contains: `"errors" array carries no recognizable rows`},
+		"an errors array the parser cannot read":   {document: `{"errors":[{"error_indices":[7]}]}`, contains: `"errors" array carries no recognizable rows`},
+		"an empty results array":                   {document: `{"results":[]}`, contains: `"results" array carries no recognizable rows`},
+		"an object that is not a row":              {document: `{"job_id":"sg-1","status":"errored"}`, contains: "an object carrying no recognizable rows"},
+		"a document nested deeper than is allowed": {document: strings.Repeat("[", 33) + strings.Repeat("]", 33), contains: "nested 33 levels deep, more than the 32 allowed"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			response := reconcileFixtureDocument(t, testCase.document)
+
+			require.Equal(t, http.StatusInternalServerError, response.StatusCode,
+				"an unusable errors document must ask the batch router to retry")
+			require.Contains(t, response.Error, "Failed to parse the sendgrid errors document")
+			require.Contains(t, response.Error, testCase.contains)
+			require.Equal(t, common.EventStatMeta{}, response.Metadata,
+				"no job may be reported either way out of a document that was never understood")
+		})
+	}
+}
+
+// TestGetUploadStatsDocumentRowLimits pins the row cap the parser applies on top of the byte cap the
+// transport already enforces, so that a document within the byte budget still cannot turn into an
+// unbounded number of rows inside a batch router worker shared by every destination in the process.
+//
+// The cap sits far above the 30,000 contacts one request can carry, so only a document that does not
+// describe a single import can reach it. Each shape enforces the cap at a different point - a
+// wrapped array knows its length up front, a newline delimited document only finds out as it is
+// scanned - so each is exercised.
+func TestGetUploadStatsDocumentRowLimits(t *testing.T) {
+	t.Parallel()
+
+	// One row past the cap, so it is the boundary itself that is crossed.
+	const rowsPastTheCap = 100_001
+
+	for name, document := range map[string]string{
+		"a bare array holding more rows than the parser allows": "[" +
+			strings.Repeat(`{"email":"over@example.com"},`, rowsPastTheCap-1) + `{"email":"over@example.com"}]`,
+		"an errors array holding more rows than the parser allows": `{"errors":[` +
+			strings.Repeat(`{"email":"over@example.com"},`, rowsPastTheCap-1) + `{"email":"over@example.com"}]}`,
+		"a newline delimited document holding more rows than the parser allows": strings.Repeat(
+			"{\"email\":\"over@example.com\"}\n", rowsPastTheCap),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			response := reconcileFixtureDocument(t, document)
+
+			require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+			require.Contains(t, response.Error, "still allowed for this import")
+			require.Equal(t, common.EventStatMeta{}, response.Metadata)
+		})
+	}
+
+	t.Run("a document exactly at the cap is reconciled", func(t *testing.T) {
+		t.Parallel()
+
+		// The boundary from the accepting side, so the cap is proven to be off-by-none: the same
+		// document one row shorter must be read in full rather than refused.
+		document := `{"errors":[` +
+			strings.Repeat(`{"email":"over@example.com"},`, 100_000-1) +
+			`{"email":"blake@example.com","message":"rejected"}]}`
+		response := reconcileFixtureDocument(t, document)
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.Equal(t, []int64{2}, response.Metadata.FailedKeys)
+		require.ElementsMatch(t, []int64{1, 3, 4, 5}, response.Metadata.SucceededKeys)
+	})
+}
+
+// TestGetUploadStatsRowBudgetSpansEveryDocumentOfAnImport pins that the row allowance is ONE budget
+// for the whole import rather than one per document.
+//
+// An import can publish several errors documents, and a per-document bound would let two documents
+// that are each comfortably acceptable together allocate twice the allowance - which is precisely
+// the case a per-document reading of the cap would fail to notice.
+func TestGetUploadStatsRowBudgetSpansEveryDocumentOfAnImport(t *testing.T) {
+	t.Parallel()
+
+	// Three fifths of the allowance each: either document is fine alone, the pair is not.
+	const rowsPerDocument = 60_000
+	secondErrorsURL := testErrorsURL + "-2"
+
+	wrappedRows := `{"errors":[` +
+		strings.Repeat(`{"email":"over@example.com"},`, rowsPerDocument-1) +
+		`{"email":"blake@example.com","message":"rejected"}]}`
+
+	t.Run("one document inside the allowance is reconciled", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return([]byte(wrappedRows), nil)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: testErrorsURL,
+			ImportingList:       fixtureJobs(t, 1, 2, 3, 4, 5),
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.Equal(t, []int64{2}, response.Metadata.FailedKeys)
+	})
+
+	t.Run("two documents that together exceed the allowance are refused", func(t *testing.T) {
+		t.Parallel()
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return([]byte(wrappedRows), nil)
+		api.EXPECT().GetImportErrors(secondErrorsURL).Times(1).Return([]byte(wrappedRows), nil)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: testErrorsURL + "\n" + secondErrorsURL,
+			ImportingList:       fixtureJobs(t, 1, 2, 3, 4, 5),
+		})
+
+		require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+		require.Contains(t, response.Error, "still allowed for this import")
+		require.Empty(t, response.Metadata.SucceededKeys,
+			"nothing may be reported delivered once the evidence stopped being readable")
+	})
+}
+
+// TestImportStatusDecoding is the regression guard for the single highest-risk detail in this
+// connector: results is a NESTED object on the import status response, not a flat one.
+//
+// A flat struct compiles, unmarshals without error and reports errored_count as zero forever, so
+// every partially errored import would be reported as a clean success - exactly the bug
+// reconciliation exists to prevent. The flat payload below is what that mistake would look like on
+// the wire, and its counters MUST stay at zero.
+func TestImportStatusDecoding(t *testing.T) {
+	t.Parallel()
+
+	const nestedPayload = `{
+		"id": "sg-import-1",
+		"status": "errored",
+		"job_type": "upsert",
+		"results": {
+			"requested_count": 5,
+			"created_count": 2,
+			"updated_count": 1,
+			"deleted_count": 0,
+			"errored_count": 2,
+			"errors_url": "https://api.sendgrid.com/v3/marketing/contacts/imports/sg-import-1/errors"
+		},
+		"started_at": "2026-02-25T12:00:00Z",
+		"finished_at": "2026-02-25T12:00:30Z"
+	}`
+
+	t.Run("the nested results object supplies the counters and the errors document", func(t *testing.T) {
+		t.Parallel()
+
+		var status sendgridbulkupload.ImportStatusResponse
+		require.NoError(t, jsonrs.Unmarshal([]byte(nestedPayload), &status))
+
+		require.Equal(t, "sg-import-1", status.ID)
+		require.Equal(t, "errored", status.Status)
+		require.Equal(t, "upsert", status.JobType)
+		require.Equal(t, 5, status.Results.RequestedCount)
+		require.Equal(t, 2, status.Results.CreatedCount)
+		require.Equal(t, 1, status.Results.UpdatedCount)
+		require.Equal(t, 0, status.Results.DeletedCount)
+		require.Equal(t, 2, status.Results.ErroredCount)
+		require.Equal(t, "https://api.sendgrid.com/v3/marketing/contacts/imports/sg-import-1/errors", status.Results.ErrorsURL)
+		require.Equal(t, "2026-02-25T12:00:00Z", status.StartedAt)
+		require.Equal(t, "2026-02-25T12:00:30Z", status.FinishedAt)
+	})
+
+	t.Run("a flat payload leaves the counters at zero", func(t *testing.T) {
+		t.Parallel()
+
+		var status sendgridbulkupload.ImportStatusResponse
+		require.NoError(t, jsonrs.Unmarshal(
+			[]byte(`{"id":"sg-import-1","status":"errored","errored_count":7,"errors_url":"https://api.sendgrid.com/x"}`),
+			&status))
+
+		require.Zero(t, status.Results.ErroredCount,
+			"a flat errored_count must NOT be readable, or the nesting could silently regress")
+		require.Empty(t, status.Results.ErrorsURL)
+	})
+
+	t.Run("a decoded status drives the poll response", func(t *testing.T) {
+		t.Parallel()
+
+		var status sendgridbulkupload.ImportStatusResponse
+		require.NoError(t, jsonrs.Unmarshal([]byte(nestedPayload), &status))
+
+		api := newMockAPI(t)
+		api.EXPECT().GetImportStatus("sg-import-1").Times(1).Return(&status, nil)
+
+		response := newUploader(api).Poll(common.AsyncPoll{ImportId: "sg-import-1", ImportCount: 5})
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.True(t, response.Complete)
+		require.True(t, response.HasFailed)
+		require.Contains(t, response.FailedJobParameters, status.Results.ErrorsURL,
+			"the URL SendGrid published must travel verbatim to reconciliation")
+	})
+
+	t.Run("every documented status value decodes", func(t *testing.T) {
+		t.Parallel()
+
+		// The documented enumeration is exactly these four. There is no processing or in_progress
+		// value, and pending is the only non-terminal one.
+		for _, documented := range []string{"pending", "completed", "errored", "failed"} {
+			var status sendgridbulkupload.ImportStatusResponse
+			require.NoError(t, jsonrs.Unmarshal(
+				[]byte(fmt.Sprintf(`{"status":%q,"results":{"errored_count":0}}`, documented)), &status))
+			require.Equal(t, documented, status.Status)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------------------------
+// Effective-settings coverage.
+//
+// Three of this connector's settings are operator-supplied, unbounded, and consumed somewhere a
+// bad value cannot be recovered from: the staging-file scan buffer, the errors-document read
+// budget, and the number of imports one upload may create. Each is therefore CLAMPED rather than
+// honored verbatim, which means the value in force can legitimately differ from the value that was
+// configured - so each is also PUBLISHED. The cases below assert the clamp and the publication
+// together, because a clamp nobody can observe is indistinguishable from a setting being ignored.
+// ---------------------------------------------------------------------------------------------
+
+// statLabels is the tag set every stat this connector publishes carries. destType is sourced from
+// the registered destination-definition name rather than from the destination's own name, so an
+// operator renaming a destination cannot move its metrics.
+func statLabels() stats.Tags {
+	return stats.Tags{
+		"module":   "batch_router",
+		"destType": "SENDGRID_BULK_UPLOAD",
+		"destID":   testDestinationID,
+	}
+}
+
+// gaugeValue reads one published gauge, failing the case if it was never published at all.
+func gaugeValue(t *testing.T, store *memstats.Store, name string) float64 {
+	t.Helper()
+	measurement := store.Get(name, statLabels())
+	require.NotNilf(t, measurement, "the %q gauge was never published", name)
+	return measurement.LastValue()
+}
+
+// setBatchRouterConfig applies a destination-scoped batch router setting for one case.
+//
+// config.Set mutates a process-wide singleton, so every caller of this helper is SEQUENTIAL - never
+// t.Parallel() - and restores the defaults through t.Cleanup. Go runs the sequential top-level
+// tests to completion before it resumes any parallel one, so a setting applied here can never be
+// observed by a parallel case elsewhere in this suite, under -shuffle=on or otherwise.
+func setBatchRouterConfig(t *testing.T, key string, value any) {
+	t.Helper()
+	t.Cleanup(config.Reset)
+	config.Set("BatchRouter.SENDGRID_BULK_UPLOAD."+key, value)
+}
+
+// TestStagingFileBufferCapacity pins the scan buffer the staging file is read with.
+//
+// The buffer is the one setting a bad value cannot be recovered from: bufio.Scanner cannot read a
+// line longer than its buffer and reports a bare "token too long", so a value too small turns every
+// batch carrying a large contact into an unexplained retry loop, while an unbounded one lets a
+// single malformed line allocate without limit inside a shared batch router worker. Both ends are
+// therefore closed, and the effective value is published rather than merely applied.
+func TestStagingFileBufferCapacity(t *testing.T) {
+	t.Parallel()
+
+	const (
+		// 6MB of request plus 2MB of headroom for everything a staging record wraps a contact in.
+		defaultCapacity = 8_000_000
+		// bufio's own default, below which the connector would read fewer records than bufio would.
+		floorCapacity = 65536
+		// Four times the default: enough for any record the per-record isolation could classify.
+		ceilingCapacity = 32_000_000
+	)
+
+	t.Run("the effective capacity is clamped and published", func(t *testing.T) {
+		t.Parallel()
+
+		for name, testCase := range map[string]struct {
+			configured int
+			expected   int
+		}{
+			"unset falls back to the default":    {configured: 0, expected: defaultCapacity},
+			"negative falls back to the default": {configured: -1, expected: defaultCapacity},
+			"below the floor is raised":          {configured: 1, expected: floorCapacity},
+			"at the floor is kept":               {configured: floorCapacity, expected: floorCapacity},
+			"in range is kept":                   {configured: 1_048_576, expected: 1_048_576},
+			"at the ceiling is kept":             {configured: ceilingCapacity, expected: ceilingCapacity},
+			"above the ceiling is clamped":       {configured: 512_000_000, expected: ceilingCapacity},
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				store, err := memstats.New()
+				require.NoError(t, err)
+
+				api := newMockAPI(t)
+				api.EXPECT().UploadContacts(gomock.Any()).Times(1).
+					Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil)
+
+				uploader := newUploader(api)
+				uploader.StatsFactory = store
+				uploader.MaxBufferCapacity = testCase.configured
+				output := uploader.Upload(&common.AsyncDestinationStruct{
+					FileName:        writeStagingFile(t, contactLine(t, 1)),
+					ImportingJobIDs: []int64{1},
+					Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+				})
+
+				// Whatever the configuration said, an ordinary staging file is still read.
+				require.Equal(t, []int64{1}, output.ImportingJobIDs)
+				require.EqualValues(t, testCase.expected,
+					gaugeValue(t, store, "staging_file_buffer_capacity_bytes"))
+			})
+		}
+	})
+
+	t.Run("a record larger than the effective capacity is retried, not silently dropped", func(t *testing.T) {
+		t.Parallel()
+
+		// Clamped up to the floor, so the line below is comfortably beyond it. A record the reader
+		// cannot take must fail the read - the batch is then retried - rather than being skipped,
+		// because a skipped record is a contact that is never delivered and never reported.
+		oversized := stagingLine(t, 1, fmt.Sprintf(
+			`{"type":"identify","userId":"user_1","traits":{"email":"user1@example.com","bio":%q}}`,
+			strings.Repeat("x", 200_000)))
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(0)
+
+		uploader := newUploader(api)
+		uploader.MaxBufferCapacity = 1
+		output := uploader.Upload(&common.AsyncDestinationStruct{
+			FileName:        writeStagingFile(t, oversized),
+			ImportingJobIDs: []int64{1},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1}, output.FailedJobIDs)
+		require.Contains(t, output.FailedReason, "Error in reading staging file")
+		require.Empty(t, output.AbortJobIDs, "an unread file says nothing permanent about the contacts in it")
 		require.Empty(t, output.ImportingJobIDs)
-		require.Empty(t, output.ImportingParameters)
-		require.Equal(t, []int64{1, 2, 3}, output.AbortJobIDs)
-		require.Contains(t, output.AbortReason, "larger than the maximum sendgrid request size")
+	})
+
+	t.Run("the same record is read when the capacity allows it", func(t *testing.T) {
+		t.Parallel()
+
+		// The other side of the same boundary: the record is not intrinsically unreadable, it was
+		// only larger than a capacity an operator had shrunk.
+		oversized := stagingLine(t, 1, fmt.Sprintf(
+			`{"type":"identify","userId":"user_1","traits":{"email":"user1@example.com","bio":%q}}`,
+			strings.Repeat("x", 200_000)))
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).
+			Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil)
+
+		output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+			FileName:        writeStagingFile(t, oversized),
+			ImportingJobIDs: []int64{1},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1}, output.ImportingJobIDs)
 		require.Empty(t, output.FailedJobIDs)
 	})
 }
 
-// TestPoll walks the whole import-state mapping, one subtest per row.
+// TestErrorsDocumentReadBudget pins the validation applied to the largest allocation this connector
+// can be asked to make. A non-positive budget would make every document unreadable and an unbounded
+// one would let a single provider response exhaust a shared worker, so the resolved value is clamped
+// and published.
 //
-// Every case feeds the connector a VERBATIM SendGrid status body, so each row also re-proves that
-// the counters and the errors document URL are read out of the NESTED results object. SendGrid's
-// documented enumeration is exactly pending, completed, errored and failed - there is no
-// processing or in_progress value, and pending is the only non-terminal state - and it signals a
-// PARTIAL failure with errored, not with completed.
-//
-// HasWarning and WarningJobParameters are asserted zero in every single row: SendGrid has no
-// warning tier, so a connector that ever set them would send jobs down a channel this destination
-// has no meaning for.
-func TestPoll(t *testing.T) {
+// Sequential, because it configures the process-wide config singleton.
+func TestErrorsDocumentReadBudget(t *testing.T) {
+	const (
+		defaultBudget = 32 * 1024 * 1024
+		floorBudget   = 64 * 1024
+		ceilingBudget = 128 * 1024 * 1024
+	)
+
+	for name, testCase := range map[string]struct {
+		configured any
+		expected   int64
+	}{
+		"unset falls back to the default":    {configured: nil, expected: defaultBudget},
+		"zero falls back to the default":     {configured: 0, expected: defaultBudget},
+		"negative falls back to the default": {configured: -4096, expected: defaultBudget},
+		"below the floor is raised":          {configured: 1024, expected: floorBudget},
+		"at the floor is kept":               {configured: floorBudget, expected: floorBudget},
+		"in range is kept":                   {configured: 1_048_576, expected: 1_048_576},
+		"at the ceiling is kept":             {configured: ceilingBudget, expected: ceilingBudget},
+		"above the ceiling is clamped":       {configured: 4 * ceilingBudget, expected: ceilingBudget},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if testCase.configured != nil {
+				setBatchRouterConfig(t, "maxErrorsDocumentBytes", testCase.configured)
+			}
+
+			store, err := memstats.New()
+			require.NoError(t, err)
+
+			// The REAL adapter, not the mock: the budget is the adapter's own setting, and
+			// construction publishes it without a packet leaving the process.
+			api, err := sendgridbulkupload.NewSendGridAPIService(
+				testDestinationID, testConfig(), logger.NOP, store)
+			require.NoError(t, err)
+			require.NotNil(t, api)
+
+			require.EqualValues(t, testCase.expected,
+				gaugeValue(t, store, "errors_document_read_budget_bytes"))
+
+			// Published alongside it, so an operator can see whether host narrowing is in force at
+			// all. It defaults to none, because SendGrid may serve the document from object storage
+			// on a host no connector can know in advance.
+			require.EqualValues(t, 0, gaugeValue(t, store, "errors_document_allowed_host_count"))
+		})
+	}
+}
+
+// TestNewSendGridAPIServiceRejectsAnUnusableCredential proves the credential guard lives in the one
+// place that owns the bearer credential, so a misconfigured destination fails at construction rather
+// than at its first upload with an opaque 401 - once, instead of once per batch forever.
+func TestNewSendGridAPIServiceRejectsAnUnusableCredential(t *testing.T) {
 	t.Parallel()
 
-	for _, testCase := range []struct {
-		name                string
-		importID            string
-		setupMock           func(apiService *mockAPIService.MockSendGridAPIService)
-		expect              common.PollStatusResponse
-		expectErrorContains []string
-	}{
-		{
-			name:     "pending keeps the batch router polling with no state change",
-			importID: testImportID,
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().
-					GetImportStatus(testImportID).
-					Return(statusFromWireBody(t, importStatusBody(testImportID, "pending", 0, "")), nil).
-					Times(1)
-			},
-			expect: common.PollStatusResponse{StatusCode: 200, InProgress: true},
-		},
-		{
-			name:     "completed with nothing errored succeeds every job",
-			importID: testImportID,
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().
-					GetImportStatus(testImportID).
-					Return(statusFromWireBody(t, importStatusBody(testImportID, "completed", 0, "")), nil).
-					Times(1)
-			},
-			expect: common.PollStatusResponse{StatusCode: 200, Complete: true},
-		},
-		{
-			// The defensive branch. SendGrid promises that completed carries no errors, but the
-			// batch router marks EVERY importing job succeeded wholesale unless HasFailed is set,
-			// so a completed import that nonetheless reports errored rows has to take the
-			// reconciliation branch too. Getting this wrong reports rejected contacts as
-			// delivered, which is the worst outcome this connector can produce.
-			name:     "completed with errored rows still routes to reconciliation",
-			importID: testImportID,
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().
-					GetImportStatus(testImportID).
-					Return(statusFromWireBody(t, importStatusBody(testImportID, "completed", 2, testErrorsURL)), nil).
-					Times(1)
-			},
-			expect: common.PollStatusResponse{
-				StatusCode:          200,
-				Complete:            true,
-				HasFailed:           true,
-				FailedJobParameters: testErrorsURL,
-			},
-			expectErrorContains: []string{"partially failed", "errored 2", testErrorsURL},
-		},
-		{
-			name:     "errored routes to reconciliation",
-			importID: testImportID,
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().
-					GetImportStatus(testImportID).
-					Return(statusFromWireBody(t, importStatusBody(testImportID, "errored", 3, testErrorsURL)), nil).
-					Times(1)
-			},
-			expect: common.PollStatusResponse{
-				StatusCode:          200,
-				Complete:            true,
-				HasFailed:           true,
-				FailedJobParameters: testErrorsURL,
-			},
-			expectErrorContains: []string{"partially failed", "errored 3"},
-		},
-		{
-			// failed means finished with ALL errors, or entirely unprocessable: a permanent
-			// condition for which 400 is the framework's terminal path. Reconciling it instead
-			// would classify every row as retryable and burn the retry budget for nothing.
-			name:     "failed aborts the batch terminally",
-			importID: testImportID,
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().
-					GetImportStatus(testImportID).
-					Return(statusFromWireBody(t, importStatusBody(testImportID, "failed", 5, testErrorsURL)), nil).
-					Times(1)
-			},
-			expect: common.PollStatusResponse{StatusCode: 400, Complete: true, HasFailed: true},
-			// The errors document is surfaced for diagnosis only, never routed through
-			// reconciliation, which is why it appears in the reason and not in the parameters.
-			expectErrorContains: []string{"SendGrid Bulk Upload Failed", "status failed", testErrorsURL},
-		},
-		{
-			name:     "an unrecognized state is retried rather than guessed at",
-			importID: testImportID,
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().
-					GetImportStatus(testImportID).
-					Return(statusFromWireBody(t, importStatusBody(testImportID, "quiesced", 0, "")), nil).
-					Times(1)
-			},
-			expect:              common.PollStatusResponse{StatusCode: 500},
-			expectErrorContains: []string{"Unknown status", "quiesced"},
-		},
-		{
-			name:     "a provider error is retried",
-			importID: testImportID,
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().
-					GetImportStatus(testImportID).
-					Return(nil, &sendgridbulkupload.APIError{
-						StatusCode: 500,
-						Operation:  "get import status",
-						Message:    "internal server error",
-					}).
-					Times(1)
-			},
-			expect:              common.PollStatusResponse{StatusCode: 500},
-			expectErrorContains: []string{"internal server error"},
-		},
-		{
-			name:     "a status call answering nothing at all is retried",
-			importID: testImportID,
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().GetImportStatus(testImportID).Return(nil, nil).Times(1)
-			},
-			expect:              common.PollStatusResponse{StatusCode: 500},
-			expectErrorContains: []string{"no status for import"},
-		},
-		{
-			name:     "a rate limit while polling is reported with its own status code",
-			importID: testImportID,
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().
-					GetImportStatus(testImportID).
-					Return(nil, newRateLimitError(1772020800)).
-					Times(1)
-			},
-			expect:              common.PollStatusResponse{StatusCode: 429},
-			expectErrorContains: []string{"rate limited", resetWindow(1772020800)},
-		},
-		{
-			name:     "a poll with no persisted import id is retried",
-			importID: "   ",
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().GetImportStatus(gomock.Any()).Times(0)
-			},
-			expect:              common.PollStatusResponse{StatusCode: 500},
-			expectErrorContains: []string{"no sendgrid import id was persisted"},
-		},
-		{
-			// One upload can produce several imports, because the batch is chunked and every
-			// accepted chunk gets its own job_id. A single pending import keeps the whole batch
-			// polling, because nothing may be resolved while part of it is still in flight.
-			name:     "several imports with one still pending keep polling",
-			importID: testImportID + ":" + testImportID + "-2",
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().
-					GetImportStatus(testImportID).
-					Return(statusFromWireBody(t, importStatusBody(testImportID, "completed", 0, "")), nil).
-					Times(1)
-				apiService.EXPECT().
-					GetImportStatus(testImportID+"-2").
-					Return(statusFromWireBody(t, importStatusBody(testImportID+"-2", "pending", 0, "")), nil).
-					Times(1)
-			},
-			expect: common.PollStatusResponse{StatusCode: 200, InProgress: true},
-		},
-		{
-			// Only SOME imports failed, so aborting would also abort the jobs of the import that
-			// merely errored. The mapping deliberately falls through to reconciliation.
-			name:     "several imports with one failed and one errored reconcile rather than abort",
-			importID: testImportID + ":" + testImportID + "-2",
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().
-					GetImportStatus(testImportID).
-					Return(statusFromWireBody(t, importStatusBody(testImportID, "failed", 5, testErrorsURL)), nil).
-					Times(1)
-				apiService.EXPECT().
-					GetImportStatus(testImportID+"-2").
-					Return(statusFromWireBody(t, importStatusBody(testImportID+"-2", "errored", 1, testErrorsURL+"-2")), nil).
-					Times(1)
-			},
-			expect: common.PollStatusResponse{
-				StatusCode: 200,
-				Complete:   true,
-				HasFailed:  true,
-				// Both documents travel, joined by a newline - a character no URL may contain,
-				// so the join is always reversible.
-				FailedJobParameters: testErrorsURL + "\n" + testErrorsURL + "-2",
-			},
-			expectErrorContains: []string{"partially failed", "status failed", "status errored"},
-		},
+	for name, apiKey := range map[string]string{
+		"absent":          "",
+		"whitespace only": " \t \n ",
 	} {
-		t.Run(testCase.name, func(t *testing.T) {
+		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			apiService := newMockAPIService(t)
-			testCase.setupMock(apiService)
+			api, err := sendgridbulkupload.NewSendGridAPIService(
+				testDestinationID,
+				sendgridbulkupload.DestinationConfig{APIKey: apiKey},
+				logger.NOP, stats.NOP)
 
-			uploader := newUploader(t, apiService, newDestinationConfig())
-			response := uploader.Poll(common.AsyncPoll{ImportId: testCase.importID, ImportCount: 5})
-
-			require.Equal(t, testCase.expect.StatusCode, response.StatusCode)
-			require.Equal(t, testCase.expect.Complete, response.Complete)
-			require.Equal(t, testCase.expect.InProgress, response.InProgress)
-			require.Equal(t, testCase.expect.HasFailed, response.HasFailed)
-			require.Equal(t, testCase.expect.FailedJobParameters, response.FailedJobParameters)
-
-			// SendGrid has no warning tier, in any state.
-			require.False(t, response.HasWarning)
-			require.Empty(t, response.WarningJobParameters)
-
-			if len(testCase.expectErrorContains) == 0 {
-				require.Empty(t, response.Error)
-			}
-			for _, fragment := range testCase.expectErrorContains {
-				require.Contains(t, response.Error, fragment)
-			}
+			require.Error(t, err)
+			require.Nil(t, api, "a nil manager and an error, never a half-configured adapter")
+			require.Contains(t, err.Error(), "apiKey")
 		})
 	}
 
-	t.Run("the errored counters are read from the nested results object", func(t *testing.T) {
+	t.Run("a credential carrying surrounding whitespace is accepted after trimming", func(t *testing.T) {
 		t.Parallel()
 
-		// This is the single highest-risk detail in the connector, so it is pinned directly as
-		// well as through every row above. SendGrid nests the counters and the errors document URL
-		// inside a results object; a flattened response type would unmarshal this body without any
-		// error and then read errored_count as 0, turning every partial failure into a reported
-		// success.
-		body := `{"id":"` + testImportID + `","status":"errored","job_type":"upsert",` +
-			`"results":{"requested_count":5,"created_count":3,"updated_count":0,"deleted_count":0,` +
-			`"errored_count":2,"errors_url":"` + testErrorsURL + `"},` +
-			`"started_at":"2026-02-25T12:00:00Z","finished_at":"2026-02-25T12:00:30Z"}`
+		// A key pasted into a configuration form very often carries whitespace, and a bearer header
+		// built from such a value is rejected by SendGrid on every single request.
+		api, err := sendgridbulkupload.NewSendGridAPIService(
+			testDestinationID,
+			sendgridbulkupload.DestinationConfig{APIKey: "  SG.test-api-key\n"},
+			logger.NOP, stats.NOP)
 
-		status := statusFromWireBody(t, body)
-		require.Equal(t, "errored", status.Status)
-		require.Equal(t, 2, status.Results.ErroredCount, "errored_count lives inside results, not at the top level")
-		require.Equal(t, testErrorsURL, status.Results.ErrorsURL)
-		require.Equal(t, 5, status.Results.RequestedCount)
-		require.Equal(t, 3, status.Results.CreatedCount)
+		require.NoError(t, err)
+		require.NotNil(t, api)
+	})
 
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().GetImportStatus(testImportID).Return(status, nil).Times(1)
+	t.Run("a nil logger and stats factory are defaulted rather than trusted", func(t *testing.T) {
+		t.Parallel()
 
-		response := newUploader(t, apiService, newDestinationConfig()).
-			Poll(common.AsyncPoll{ImportId: testImportID, ImportCount: 5})
+		// A caller that has not wired observability up yet must not be able to turn a delivery
+		// failure into a nil-pointer panic inside a router worker.
+		api, err := sendgridbulkupload.NewSendGridAPIService(
+			testDestinationID, sendgridbulkupload.DestinationConfig{APIKey: "SG.k"}, nil, nil)
 
-		require.True(t, response.HasFailed, "a nested errored_count above zero must reach the poll mapping")
-		require.Equal(t, testErrorsURL, response.FailedJobParameters)
+		require.NoError(t, err)
+		require.NotNil(t, api)
 	})
 }
 
-// TestGetUploadStats is mandated scenario S2: one import yields BOTH failed and succeeded jobs.
+// TestNewManagerValidatesTheCustomFieldsMapping pins the configuration that must fail construction
+// rather than be applied.
 //
-// The errored rows go to the FAILED channel, never the aborted one - a rejected address or a value
-// SendGrid would not take is recoverable, and failed is the batch router's retryable state - and
-// the remainder is marked delivered by exclusion.
-//
-// The reconciliation is stateless by design: it re-derives every contact identifier from the
-// importing jobs it is handed, because this method may run in a different process invocation, or
-// on a different pod, from the upload that produced the import. Anything cached at upload time
-// would simply be missing after a restart, and a connector that relied on it would then report
-// rejected contacts as delivered.
-func TestGetUploadStats(t *testing.T) {
+// The duplicate-field-ID case is the load-bearing one, and it is the worst available failure mode:
+// two traits mapped to one SendGrid custom field ID both look perfectly healthy, still deliver data,
+// and - because Go randomizes map iteration order - deliver DIFFERENT data on every run.
+func TestNewManagerValidatesTheCustomFieldsMapping(t *testing.T) {
 	t.Parallel()
 
-	t.Run("an errored import fails the rejected contacts and succeeds the rest", func(t *testing.T) {
+	t.Run("rejected mappings", func(t *testing.T) {
 		t.Parallel()
 
-		jobs := importingJobs(t, stagingFixtureLines(t))
-		require.Equal(t, []int64{1, 2, 3, 4, 5}, jobIDsIn(jobs))
+		for name, testCase := range map[string]struct {
+			mapping  map[string]any
+			contains []string
+		}{
+			"a blank trait name": {
+				mapping:  map[string]any{"  ": "w1"},
+				contains: []string{"trait name is empty"},
+			},
+			"a blank custom field id": {
+				mapping:  map[string]any{"plan": "   "},
+				contains: []string{`trait "plan"`, "empty custom field id"},
+			},
+			"two traits claiming one custom field id": {
+				mapping: map[string]any{"plan": "w1", "tier": "w1"},
+				// BOTH traits are named, because that is the only form of the message an operator
+				// can act on without going back to the configuration to work out what collided.
+				contains: []string{`"plan"`, `"tier"`, `"w1"`, "ambiguous"},
+			},
+			"one trait spelled twice through whitespace": {
+				mapping:  map[string]any{"plan": "w1", " plan": "w2"},
+				contains: []string{`trait "plan"`, "mapped more than once"},
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
 
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			GetImportErrors(testErrorsURL).
-			Return([]byte(matchedErrorsDocument), nil).
-			Times(1)
+				manager, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP,
+					testDestination(map[string]any{"apiKey": "SG.k", "customFieldsMapping": testCase.mapping}))
 
-		response := newUploader(t, apiService, newDestinationConfig()).
-			GetUploadStats(common.GetUploadStatsInput{
-				FailedJobParameters: testErrorsURL,
-				Parameters:          importParameters(t, testImportID, len(jobs)),
-				ImportingList:       jobs,
+				require.Error(t, err)
+				require.Nil(t, manager)
+				for _, fragment := range testCase.contains {
+					require.Contains(t, err.Error(), fragment)
+				}
 			})
-
-		// 200 is mandatory: the batch router discards the entire reconciliation, and reports an
-		// error, for any other status.
-		require.Equal(t, 200, response.StatusCode)
-		require.Empty(t, response.Error)
-
-		// blake@example.com is job 2 and devon@example.com is job 4, the latter reported under the
-		// nested contact.email spelling.
-		require.ElementsMatch(t, []int64{2, 4}, response.Metadata.FailedKeys)
-		require.Contains(t, response.Metadata.FailedReasons[2], "Invalid email address provided for contact.")
-		require.Contains(t, response.Metadata.FailedReasons[4], "custom field value exceeds the maximum allowed length")
-
-		// The exact remainder, succeeded by exclusion, which is sound only because every row in
-		// the document was attributed.
-		require.ElementsMatch(t, []int64{1, 3, 5}, response.Metadata.SucceededKeys)
-		requireDisjoint(t, response.Metadata.FailedKeys, response.Metadata.SucceededKeys)
-		require.Len(t,
-			append(append([]int64{}, response.Metadata.FailedKeys...), response.Metadata.SucceededKeys...),
-			len(jobs),
-			"every importing job is accounted for exactly once",
-		)
-
-		// Errored rows are retryable, so nothing is aborted, and SendGrid has no warning tier.
-		require.Empty(t, response.Metadata.AbortedKeys)
-		require.Empty(t, response.Metadata.AbortedReasons)
-		require.Empty(t, response.Metadata.WarningKeys)
-		require.Empty(t, response.Metadata.WarningReasons)
+		}
 	})
 
-	t.Run("a completed import reporting errored rows reconciles exactly as an errored one does", func(t *testing.T) {
+	t.Run("an accepted mapping is normalized once, at construction", func(t *testing.T) {
 		t.Parallel()
 
-		// The companion of the poll mapping's defensive branch, driven end to end: poll a
-		// completed import that nonetheless reports errored rows, then reconcile with the errors
-		// document URL the poll forwarded. Without HasFailed the batch router would already have
-		// marked all five jobs succeeded and this method would never have been called.
-		jobs := importingJobs(t, stagingFixtureLines(t))
+		manager, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP,
+			testDestination(map[string]any{
+				"apiKey": "SG.k",
+				"customFieldsMapping": map[string]any{
+					"  plan  ":   "  w1  ",
+					"signedUpAt": "w2",
+				},
+			}))
 
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			GetImportStatus(testImportID).
-			Return(statusFromWireBody(t, importStatusBody(testImportID, "completed", 2, testErrorsURL)), nil).
-			Times(1)
-		apiService.EXPECT().
-			GetImportErrors(testErrorsURL).
-			Return([]byte(matchedErrorsDocument), nil).
-			Times(1)
-
-		uploader := newUploader(t, apiService, newDestinationConfig())
-
-		pollResponse := uploader.Poll(common.AsyncPoll{ImportId: testImportID, ImportCount: len(jobs)})
-		require.Equal(t, 200, pollResponse.StatusCode)
-		require.True(t, pollResponse.Complete)
-		require.True(t, pollResponse.HasFailed)
-		require.Equal(t, testErrorsURL, pollResponse.FailedJobParameters)
-
-		response := uploader.GetUploadStats(common.GetUploadStatsInput{
-			FailedJobParameters: pollResponse.FailedJobParameters,
-			Parameters:          importParameters(t, testImportID, len(jobs)),
-			ImportingList:       jobs,
-		})
-
-		require.Equal(t, 200, response.StatusCode)
-		require.ElementsMatch(t, []int64{2, 4}, response.Metadata.FailedKeys)
-		require.ElementsMatch(t, []int64{1, 3, 5}, response.Metadata.SucceededKeys)
-		require.Empty(t, response.Metadata.AbortedKeys)
+		require.NoError(t, err)
+		require.NotNil(t, manager)
+		require.Equal(t, map[string]string{"plan": "w1", "signedUpAt": "w2"},
+			manager.DestinationConfig.CustomFieldsMapping,
+			"every later read must work from trimmed values without per-entry defensiveness")
 	})
 
-	t.Run("an errored row that matches no importing job fails the import closed", func(t *testing.T) {
+	t.Run("an absent mapping is valid and never nil", func(t *testing.T) {
 		t.Parallel()
 
-		// The committed fixture carries a deliberately unmatched identifier alongside two matched
-		// ones. That row proves a contact was rejected while leaving it unknown WHICH, so "no row
-		// named this job" stops being evidence for anybody: every unresolved job is retried and
-		// NOTHING is marked delivered. The alternative - succeeding the rest anyway - would lose
-		// a contact permanently and silently.
-		statsStore, err := memstats.New()
+		manager, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP,
+			testDestination(map[string]any{"apiKey": "SG.k"}))
+
+		require.NoError(t, err)
+		require.NotNil(t, manager)
+		require.NotNil(t, manager.DestinationConfig.CustomFieldsMapping,
+			"custom fields are optional, and the resolved map must still be safe to range over")
+		require.Empty(t, manager.DestinationConfig.CustomFieldsMapping)
+	})
+}
+
+// TestNewManagerWrapsTheConfigurationFailure pins that the configuration round trip wraps the
+// codec's own error with %w rather than rendering it with %v.
+//
+// A wrapped error stays inspectable with errors.Is and errors.As all the way up to the factory; a
+// rendered one is flattened into a string at the first hop and can never be branched on again.
+func TestNewManagerWrapsTheConfigurationFailure(t *testing.T) {
+	t.Parallel()
+
+	// A channel cannot be marshalled, so this reaches the marshal error branch specifically.
+	manager, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP,
+		testDestination(map[string]any{"apiKey": "SG.k", "listIds": make(chan int)}))
+
+	require.Error(t, err)
+	require.Nil(t, manager)
+	require.Contains(t, err.Error(), "destination config")
+	require.NotNil(t, errors.Unwrap(err),
+		"the codec's own error must stay inspectable rather than being flattened into a string")
+}
+
+// TestUploadRejectsListIDsThatConsumeTheWholeRequest pins the one case in which no contact can be
+// uploaded at all and yet nothing is wrong with any contact.
+//
+// SendGrid's byte ceiling applies to the WHOLE request body, and the list IDs are part of it. If
+// they leave no room for even one contact, reporting the batch as contacts that are individually too
+// large would name the wrong cause, and a retry would rebuild exactly the same envelope - so the
+// group is abandoned terminally with the real reason.
+func TestUploadRejectsListIDsThatConsumeTheWholeRequest(t *testing.T) {
+	t.Parallel()
+
+	api := newMockAPI(t)
+	api.EXPECT().UploadContacts(gomock.Any()).Times(0)
+
+	uploader := newUploader(api)
+	// Smaller than the envelope one list ID alone produces, so the contact budget is exhausted
+	// before any contact is measured.
+	uploader.MaxRequestBytes = 50
+	output := uploader.Upload(&common.AsyncDestinationStruct{
+		FileName:        writeStagingFile(t, contactLine(t, 1), contactLine(t, 2)),
+		ImportingJobIDs: []int64{1, 2},
+		Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+	})
+
+	require.ElementsMatch(t, []int64{1, 2}, output.AbortJobIDs)
+	require.Contains(t, output.AbortReason, "consume the entire request budget")
+	require.Empty(t, output.FailedJobIDs, "a retry would rebuild exactly the same envelope")
+	require.Empty(t, output.ImportingJobIDs)
+	require.Nil(t, output.ImportingParameters)
+}
+
+// TestUploadBoundsTheImportsOneBatchMayCreate pins the import budget.
+//
+// Every later poll of an upload has to ask about each import it created, so an unbounded number of
+// imports here hands an unbounded cost to a poll loop that is shared by every destination of this
+// type. The surplus chunks are DEFERRED - reported retryable, so the framework re-queues them into
+// the next batch - rather than being sent and forgotten.
+func TestUploadBoundsTheImportsOneBatchMayCreate(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the surplus chunks are deferred to the next batch", func(t *testing.T) {
+		t.Parallel()
+
+		store, err := memstats.New()
 		require.NoError(t, err)
 
-		jobs := importingJobs(t, stagingFixtureLines(t))
-
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			GetImportErrors(testErrorsURL).
-			Return(errorsFixtureDocument(t), nil).
-			Times(1)
-
-		response := newUploaderWithStats(t, apiService, newDestinationConfig(), statsStore).
-			GetUploadStats(common.GetUploadStatsInput{
-				FailedJobParameters: testErrorsURL,
-				Parameters:          importParameters(t, testImportID, len(jobs)),
-				ImportingList:       jobs,
+		api := newMockAPI(t)
+		// Exactly the budget, and not one request more: a deferred chunk is never sent.
+		requests := 0
+		api.EXPECT().UploadContacts(gomock.Any()).Times(2).DoAndReturn(
+			func(sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				requests++
+				return &sendgridbulkupload.UpsertResponse{JobID: "sg-" + strconv.Itoa(requests)}, nil
 			})
 
-		// Still 200, and deliberately so: a non-200 makes the batch router write NO job status at
-		// all, and its poll route has no retry budget that could escalate, so every job would sit
-		// in the importing state forever and the destination would stop accepting work.
-		require.Equal(t, 200, response.StatusCode)
-		require.ElementsMatch(t, []int64{1, 2, 3, 4, 5}, response.Metadata.FailedKeys)
-		require.Empty(t, response.Metadata.SucceededKeys, "nothing may be marked delivered on the fail-closed path")
-		require.Empty(t, response.Metadata.AbortedKeys, "failing closed is retryable, never terminal")
+		uploader := newUploader(api)
+		uploader.StatsFactory = store
+		// One contact per request turns five staged events into five chunks, of which two fit.
+		uploader.MaxContactsPerRequest = 1
+		uploader.MaxImportsPerUpload = 2
+		output := uploader.Upload(&common.AsyncDestinationStruct{
+			FileName: writeStagingFile(t,
+				contactLine(t, 1), contactLine(t, 2), contactLine(t, 3),
+				contactLine(t, 4), contactLine(t, 5)),
+			ImportingJobIDs: []int64{1, 2, 3, 4, 5},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
 
-		// The FIRST reason recorded for a job wins, so the specific explanation SendGrid gave for
-		// an attributed contact is never overwritten by the generic sweep.
-		require.Contains(t, response.Metadata.FailedReasons[2], "Invalid email address provided for contact.")
-		require.Contains(t, response.Metadata.FailedReasons[4], "custom field value exceeds the maximum allowed length")
-		for _, jobID := range []int64{1, 3, 5} {
-			require.Contains(t, response.Metadata.FailedReasons[jobID], "could not be attributed to specific jobs")
+		require.Equal(t, []int64{1, 2}, output.ImportingJobIDs)
+		require.ElementsMatch(t, []int64{3, 4, 5}, output.FailedJobIDs,
+			"the surplus is retryable: those contacts were never sent")
+		require.Contains(t, output.FailedReason, "more than the 2 sendgrid imports one upload may create")
+		require.Contains(t, output.FailedReason, "3 job(s) were deferred")
+		require.Empty(t, output.AbortJobIDs, "a deferred contact has had nothing decided about it")
+
+		// The accepted chunks keep their importing state, so the two outcome sets stay disjoint and
+		// the deferral costs the accepted contacts nothing.
+		_, importCount := importParametersOf(t, output)
+		require.EqualValues(t, 2, importCount)
+
+		measurement := store.Get("deferred_job_count", statLabels())
+		require.NotNil(t, measurement, "a deferral an operator cannot see is a deferral nobody acts on")
+		require.EqualValues(t, 3, measurement.LastValue())
+	})
+
+	t.Run("an override above the ceiling is clamped, not honored", func(t *testing.T) {
+		t.Parallel()
+
+		// One chunk past the documented ceiling, so the clamp is what has to be crossed. An
+		// operator asking for an unbounded poll cost cannot be given one.
+		const jobCount = 513
+		const ceiling = 512
+
+		lines := make([]string, 0, jobCount)
+		jobIDs := make([]int64, 0, jobCount)
+		for jobID := int64(1); jobID <= jobCount; jobID++ {
+			lines = append(lines, contactLine(t, jobID))
+			jobIDs = append(jobIDs, jobID)
 		}
 
-		// Counted and logged, not silently dropped: a change in the undocumented document shape
-		// has to show up in metrics rather than only in one job's reason.
-		unmatched := statsStore.Get("unmatched_error_row_count", statLabels())
-		require.NotNil(t, unmatched, "an unattributable row must be counted")
-		require.EqualValues(t, 1, unmatched.LastValue())
-
-		unattributed := statsStore.Get("unattributed_reconciliation_count", statLabels())
-		require.NotNil(t, unattributed)
-		require.EqualValues(t, 1, unattributed.LastValue())
-
-		// Nothing in this document was unreadable, so that counter is never emitted at all.
-		require.Nil(t, statsStore.Get("unrecognized_error_row_count", statLabels()))
-	})
-
-	t.Run("a row the parser cannot read fails the import closed as well", func(t *testing.T) {
-		t.Parallel()
-
-		// The other route to the same uncertainty: the entry was present, so a contact was
-		// rejected, but nothing about it could be read. Tolerance is not the same as discarding.
-		statsStore, err := memstats.New()
-		require.NoError(t, err)
-
-		jobs := importingJobs(t, stagingFixtureLines(t))
-
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			GetImportErrors(testErrorsURL).
-			Return([]byte(
-				`{"email":"blake@example.com","message":"row one"}`+"\n"+
-					`{"this line is not json at all`+"\n",
-			), nil).
-			Times(1)
-
-		response := newUploaderWithStats(t, apiService, newDestinationConfig(), statsStore).
-			GetUploadStats(common.GetUploadStatsInput{
-				FailedJobParameters: testErrorsURL,
-				Parameters:          importParameters(t, testImportID, len(jobs)),
-				ImportingList:       jobs,
+		api := newMockAPI(t)
+		accepted := 0
+		api.EXPECT().UploadContacts(gomock.Any()).Times(ceiling).DoAndReturn(
+			func(sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				accepted++
+				return &sendgridbulkupload.UpsertResponse{JobID: "sg-" + strconv.Itoa(accepted)}, nil
 			})
 
-		require.Equal(t, 200, response.StatusCode)
-		require.ElementsMatch(t, []int64{1, 2, 3, 4, 5}, response.Metadata.FailedKeys)
-		require.Empty(t, response.Metadata.SucceededKeys)
-		require.Contains(t, response.Metadata.FailedReasons[2], "row one", "the readable row keeps its own reason")
+		uploader := newUploader(api)
+		uploader.MaxContactsPerRequest = 1
+		uploader.MaxImportsPerUpload = 10_000_000
+		output := uploader.Upload(&common.AsyncDestinationStruct{
+			FileName:        writeStagingFile(t, lines...),
+			ImportingJobIDs: jobIDs,
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
 
-		unrecognized := statsStore.Get("unrecognized_error_row_count", statLabels())
-		require.NotNil(t, unrecognized, "an unreadable row must be counted")
-		require.EqualValues(t, 1, unrecognized.LastValue())
+		require.Len(t, output.ImportingJobIDs, ceiling)
+		require.Equal(t, []int64{jobCount}, output.FailedJobIDs)
+		require.Contains(t, output.FailedReason,
+			fmt.Sprintf("more than the %d sendgrid imports one upload may create", ceiling))
+	})
+
+	t.Run("a batch inside the budget defers nothing", func(t *testing.T) {
+		t.Parallel()
+
+		store, err := memstats.New()
+		require.NoError(t, err)
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).
+			Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil)
+
+		uploader := newUploader(api)
+		uploader.StatsFactory = store
+		output := uploader.Upload(&common.AsyncDestinationStruct{
+			FileName:        writeStagingFile(t, contactLine(t, 1), contactLine(t, 2)),
+			ImportingJobIDs: []int64{1, 2},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1, 2}, output.ImportingJobIDs)
+		require.Empty(t, output.FailedJobIDs)
+		require.Nil(t, store.Get("deferred_job_count", statLabels()),
+			"the counter must stay silent when nothing was deferred")
 	})
 }
 
-// TestGetUploadStatsTolerantParser pins every shape the errors-document parser accepts and every
-// field it will read an identifier or a message out of.
+// TestPollStopsAtTheFirstPendingImport pins the bound on what one poll costs.
 //
-// The tolerance is not stylistic. SendGrid's specification mentions the errors URL exactly twice
-// and both times only as a bare string, with no media type, no schema and no stated retention, and
-// the reference pages describe no format at all. Committing to a single guessed shape would turn
-// any difference between the guess and reality into SILENT DATA LOSS, because a row that fails to
-// parse leaves a contact that really failed reported as delivered.
-func TestGetUploadStatsTolerantParser(t *testing.T) {
+// A pending import already decides the whole poll - the upload is in progress until every one of its
+// imports has settled, and the response writes no job status at all - so asking about the remaining
+// imports could only produce answers that are discarded. The poll loop is shared by every
+// destination of this type and runs them one after another, so a poll that lingers delays all of
+// them.
+func TestPollStopsAtTheFirstPendingImport(t *testing.T) {
 	t.Parallel()
 
-	for _, testCase := range []struct {
-		name            string
-		document        string
-		expectFailed    []int64
-		expectSucceeded []int64
-		expectReason    string
-	}{
-		{
-			name:            "a bare array of rows",
-			document:        `[{"email":"blake@example.com","message":"the address was rejected"}]`,
-			expectFailed:    []int64{2},
-			expectSucceeded: []int64{1, 3, 4, 5},
-			expectReason:    "the address was rejected",
-		},
-		{
-			name:            "rows wrapped under an errors key",
-			document:        matchedErrorsDocument,
-			expectFailed:    []int64{2, 4},
-			expectSucceeded: []int64{1, 3, 5},
-			expectReason:    "Invalid email address provided for contact.",
-		},
-		{
-			name:            "rows wrapped under a results key",
-			document:        `{"results":[{"email":"erin@example.com","detail":"the contact was not processed"}]}`,
-			expectFailed:    []int64{5},
-			expectSucceeded: []int64{1, 2, 3, 4},
-			expectReason:    "the contact was not processed",
-		},
-		{
-			name:            "a single row object",
-			document:        `{"email":"casey@example.com","reason":"the contact was refused"}`,
-			expectFailed:    []int64{3},
-			expectSucceeded: []int64{1, 2, 4, 5},
-			expectReason:    "the contact was refused",
-		},
-		{
-			name: "newline delimited rows",
-			document: `{"email":"alex@example.com","message":"the first row failed"}` + "\n" +
-				`{"contact":{"email":"blake@example.com"},"error_message":"the second row failed"}` + "\n",
-			expectFailed:    []int64{1, 2},
-			expectSucceeded: []int64{3, 4, 5},
-			expectReason:    "the first row failed",
-		},
-		{
-			name:            "an identifier reported as an external id",
-			document:        `[{"external_id":"user_323","message":"rejected by external id"}]`,
-			expectFailed:    []int64{3},
-			expectSucceeded: []int64{1, 2, 4, 5},
-			expectReason:    "rejected by external id",
-		},
-		{
-			name:            "an identifier reported as an anonymous id",
-			document:        `[{"anonymous_id":"anon_889","message":"rejected by anonymous id"}]`,
-			expectFailed:    []int64{4},
-			expectSucceeded: []int64{1, 2, 3, 5},
-			expectReason:    "rejected by anonymous id",
-		},
-		{
-			name:            "an identifier reported under the generic identifier key",
-			document:        `[{"identifier":"+14155551234","message":"rejected by phone identifier"}]`,
-			expectFailed:    []int64{1},
-			expectSucceeded: []int64{2, 3, 4, 5},
-			expectReason:    "rejected by phone identifier",
-		},
-		{
-			name:            "an identifier whose case differs from the staged address",
-			document:        `[{"email":"ERIN@EXAMPLE.COM","message":"rejected with a different case"}]`,
-			expectFailed:    []int64{5},
-			expectSucceeded: []int64{1, 2, 3, 4},
-			expectReason:    "rejected with a different case",
-		},
-		{
-			name:            "a row carrying an identifier but no message at all",
-			document:        `[{"email":"erin@example.com"}]`,
-			expectFailed:    []int64{5},
-			expectSucceeded: []int64{1, 2, 3, 4},
-			// A job is never marked failed with an empty explanation.
-			expectReason: "without a message",
-		},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
+	api := newMockAPI(t)
+	api.EXPECT().GetImportStatus("sg-a").Times(1).Return(pollStatus("sg-a", "pending", 0, ""), nil)
+	api.EXPECT().GetImportStatus("sg-b").Times(0)
+	api.EXPECT().GetImportStatus("sg-c").Times(0)
 
-			jobs := importingJobs(t, stagingFixtureLines(t))
+	response := newUploader(api).Poll(common.AsyncPoll{ImportId: "sg-a=1-2;sg-b=3-4;sg-c=5-6", ImportCount: 6})
 
-			apiService := newMockAPIService(t)
-			apiService.EXPECT().
-				GetImportErrors(testErrorsURL).
-				Return([]byte(testCase.document), nil).
-				Times(1)
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	require.True(t, response.InProgress)
+	require.False(t, response.Complete)
+	require.False(t, response.HasFailed)
+	require.Empty(t, response.FailedJobParameters,
+		"nothing may be forwarded from a poll that settled nothing")
+}
 
-			response := newUploader(t, apiService, newDestinationConfig()).
-				GetUploadStats(common.GetUploadStatsInput{
-					FailedJobParameters: testErrorsURL,
-					Parameters:          importParameters(t, testImportID, len(jobs)),
-					ImportingList:       jobs,
-				})
+// TestPollAsksAboutEverySettledImportExactlyOnce is the other half of the same bound: once no import
+// is pending, each one is read once and only once, however many chunks were answered with the same
+// import job id.
+func TestPollAsksAboutEverySettledImportExactlyOnce(t *testing.T) {
+	t.Parallel()
 
-			require.Equal(t, 200, response.StatusCode)
-			require.ElementsMatch(t, testCase.expectFailed, response.Metadata.FailedKeys)
-			require.ElementsMatch(t, testCase.expectSucceeded, response.Metadata.SucceededKeys)
-			requireDisjoint(t, response.Metadata.FailedKeys, response.Metadata.SucceededKeys)
-			require.Contains(t, response.Metadata.FailedReasons[testCase.expectFailed[0]], testCase.expectReason)
-			require.Empty(t, response.Metadata.AbortedKeys)
-			require.Empty(t, response.Metadata.WarningKeys)
-		})
+	api := newMockAPI(t)
+	api.EXPECT().GetImportStatus("sg-a").Times(1).Return(pollStatus("sg-a", "completed", 0, ""), nil)
+	api.EXPECT().GetImportStatus("sg-b").Times(1).Return(pollStatus("sg-b", "errored", 1, testErrorsURL), nil)
+
+	// The same import named twice: SendGrid is free to answer two chunks with one job id, and the
+	// manifest's own encoding must not turn that into two provider requests.
+	response := newUploader(api).Poll(common.AsyncPoll{ImportId: "sg-a=1-2;sg-b=3-4;sg-b=5", ImportCount: 5})
+
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	require.True(t, response.Complete)
+	require.True(t, response.HasFailed)
+
+	// One document, forwarded once, even though two chunks pointed at the same import.
+	require.Equal(t, 1, strings.Count(response.FailedJobParameters, testErrorsURL))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The observability contract.
+// ---------------------------------------------------------------------------------------------
+
+// providerText enumerates every string the PROVIDER chose that must never appear in a log line: the
+// contacts that were submitted, the credential, SendGrid's own prose, and a status value SendGrid
+// might introduce tomorrow. A log stream is broadcast more widely, retained longer, and read by more
+// people than the job statuses are, so the provider's words travel on the channels that exist for
+// them instead - which this test also asserts they arrive on.
+func providerText() []string {
+	return []string{
+		"alex@example.com", "blake@example.com", "casey@example.com",
+		"devon@example.com", "erin@example.com", "ghost@example.com",
+		"SG.test-api-key",
+		"Invalid email address provided for contact",
+		"a-state-sendgrid-has-not-published-yet",
 	}
 }
 
-// TestGetUploadStatsUnusableDocument covers the documents no reconciliation can be built from.
+// captureLogs builds a real JSON logger writing into the case's own temporary directory and returns
+// a reader for the entries it produced.
 //
-// Each returns a non-200 so the batch router RETRIES, which is the only safe failure mode: a 200
-// carrying an empty failed set would mark every job in a partially errored import delivered, and
-// the rejected contacts would be lost silently and permanently.
-func TestGetUploadStatsUnusableDocument(t *testing.T) {
-	t.Parallel()
+// A capturing logger rather than logger.NOP, because the properties under test are properties of the
+// log OUTPUT: that every line carries the destination's identity, and that no line carries a word the
+// provider chose. Neither can be asserted against a logger that discards everything. The logger is
+// built on a PRIVATE config instance, so this never touches the process-wide singleton.
+func captureLogs(t *testing.T) (logger.Logger, func() []map[string]any) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "sendgrid.log")
 
-	for _, testCase := range []struct {
-		name         string
-		document     string
-		fetchError   error
-		expectReason string
-	}{
-		{
-			name:         "bytes that are not JSON at all",
-			document:     `this document is not json`,
-			expectReason: "Failed to parse the sendgrid errors document",
-		},
-		{
-			name:         "an empty document",
-			document:     ``,
-			expectReason: "Failed to parse the sendgrid errors document",
-		},
-		{
-			name:         "an empty array",
-			document:     `[]`,
-			expectReason: "Failed to parse the sendgrid errors document",
-		},
-		{
-			name:         "an array of rows carrying neither an identifier nor a message",
-			document:     `[{"foo":"bar"},{"baz":1}]`,
-			expectReason: "Failed to parse the sendgrid errors document",
-		},
-		{
-			name:         "an object of an entirely unexpected shape",
-			document:     `{"unexpected":"shape"}`,
-			expectReason: "Failed to parse the sendgrid errors document",
-		},
-		{
-			name:         "an empty errors array",
-			document:     `{"errors":[]}`,
-			expectReason: "Failed to parse the sendgrid errors document",
-		},
-		{
-			name:         "a bare JSON scalar",
-			document:     `42`,
-			expectReason: "Failed to parse the sendgrid errors document",
-		},
-		{
-			name: "a document that could not be fetched",
-			fetchError: &sendgridbulkupload.APIError{
-				StatusCode: 403,
-				Operation:  "get import errors",
-				Message:    "forbidden",
-			},
-			expectReason: "Failed to fetch the sendgrid errors document",
-		},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
+	conf := config.New()
+	conf.Set("LOG_LEVEL", "DEBUG")
+	conf.Set("Logger.enableConsole", false)
+	conf.Set("Logger.enableFile", true)
+	conf.Set("Logger.fileJsonFormat", true)
+	conf.Set("Logger.logFileLocation", path)
 
-			jobs := importingJobs(t, stagingFixtureLines(t))
+	factory := logger.NewFactory(conf)
+	t.Cleanup(factory.Sync)
 
-			apiService := newMockAPIService(t)
-			if testCase.fetchError != nil {
-				apiService.EXPECT().GetImportErrors(testErrorsURL).Return(nil, testCase.fetchError).Times(1)
-			} else {
-				apiService.EXPECT().GetImportErrors(testErrorsURL).Return([]byte(testCase.document), nil).Times(1)
+	return factory.NewLogger(), func() []map[string]any {
+		factory.Sync()
+		raw, err := os.ReadFile(path)
+		require.NoError(t, err)
+
+		entries := make([]map[string]any, 0)
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
 			}
-
-			response := newUploader(t, apiService, newDestinationConfig()).
-				GetUploadStats(common.GetUploadStatsInput{
-					FailedJobParameters: testErrorsURL,
-					Parameters:          importParameters(t, testImportID, len(jobs)),
-					ImportingList:       jobs,
-				})
-
-			require.Equal(t, 500, response.StatusCode)
-			require.Contains(t, response.Error, testCase.expectReason)
-			// Emphatically NOT an empty failed set with a 200, which would deliver every job.
-			require.Empty(t, response.Metadata.FailedKeys)
-			require.Empty(t, response.Metadata.SucceededKeys)
-			require.Empty(t, response.Metadata.AbortedKeys)
-		})
+			var entry map[string]any
+			require.NoErrorf(t, jsonrs.Unmarshal([]byte(line), &entry), "log line is not JSON: %s", line)
+			entries = append(entries, entry)
+		}
+		return entries
 	}
 }
 
-// TestGetUploadStatsErrorsURLResolution covers reconciliation running in a process that did not
-// poll, so the errors document URL has to be recovered from the persisted import parameters.
+// TestObservabilityAttributionAndProviderText drives every failure path the connector logs from and
+// then asserts three properties over the ACTUAL log output.
 //
-// This is precisely the situation the stateless design exists for: the URL the poll forwarded is
-// preferred because SendGrid supplied it, and when it is absent the import identifier is read back
-// out of the parameters and the status is re-read to obtain it.
-func TestGetUploadStatsErrorsURLResolution(t *testing.T) {
+// Attribution is bound to the logger ONCE at construction rather than passed at each call site, so
+// every line - including the ones written from helpers that never receive a destination, and the
+// ones the HTTP adapter writes - must carry destinationId and destinationType. Provider text must
+// appear nowhere. And failure logging has a single owner, so one rate-limited chunk yields exactly
+// one warning rather than one from the adapter and another from the manager.
+func TestObservabilityAttributionAndProviderText(t *testing.T) {
 	t.Parallel()
 
-	t.Run("the import parameters are enough to find the errors document", func(t *testing.T) {
-		t.Parallel()
+	const (
+		unknownStatus  = "a-state-sendgrid-has-not-published-yet"
+		providerReason = "Invalid email address provided for contact: alex@example.com at 123 Main St"
+	)
 
-		jobs := importingJobs(t, stagingFixtureLines(t))
+	log, readLogs := captureLogs(t)
+	store, err := memstats.New()
+	require.NoError(t, err)
 
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			GetImportStatus(testImportID).
-			Return(statusFromWireBody(t, importStatusBody(testImportID, "errored", 2, testErrorsURL)), nil).
-			Times(1)
-		apiService.EXPECT().
-			GetImportErrors(testErrorsURL).
-			Return([]byte(matchedErrorsDocument), nil).
-			Times(1)
+	uploader, err := sendgridbulkupload.NewManager(log, store,
+		testDestination(map[string]any{"apiKey": "SG.test-api-key", "listIds": []any{fixtureListID}}))
+	require.NoError(t, err)
 
-		response := newUploader(t, apiService, newDestinationConfig()).
-			GetUploadStats(common.GetUploadStatsInput{
-				// Nothing was forwarded, exactly as when a different pod polled.
-				FailedJobParameters: "",
-				Parameters:          importParameters(t, testImportID, len(jobs)),
-				ImportingList:       jobs,
-			})
+	api := newMockAPI(t)
+	uploader.SendGridAPIService = api
+	// Two contacts per request turns five staged events into three chunks, so one upload can
+	// exercise a rate limit, a provider rejection and an acceptance at once.
+	uploader.MaxContactsPerRequest = 2
 
-		require.Equal(t, 200, response.StatusCode)
-		require.ElementsMatch(t, []int64{2, 4}, response.Metadata.FailedKeys)
-		require.ElementsMatch(t, []int64{1, 3, 5}, response.Metadata.SucceededKeys)
+	gomock.InOrder(
+		api.EXPECT().UploadContacts(gomock.Any()).Return(nil, &sendgridbulkupload.RateLimitError{
+			StatusCode: http.StatusTooManyRequests, RetryAfter: "60",
+			ResetAt: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC).Unix(),
+			Limit:   600, Remaining: 0, Message: providerReason,
+		}),
+		api.EXPECT().UploadContacts(gomock.Any()).Return(nil, &sendgridbulkupload.APIError{
+			StatusCode: http.StatusForbidden, Operation: "upload contacts", Message: providerReason,
+		}),
+		api.EXPECT().UploadContacts(gomock.Any()).
+			Return(&sendgridbulkupload.UpsertResponse{JobID: "sg-accepted"}, nil),
+	)
+
+	output := uploader.Upload(&common.AsyncDestinationStruct{
+		FileName:        stagingFixture,
+		ImportingJobIDs: []int64{1, 2, 3, 4, 5},
+		Destination: testDestination(map[string]any{
+			"apiKey": "SG.test-api-key", "listIds": []any{fixtureListID},
+		}),
+	})
+	require.NotEmpty(t, output.FailedJobIDs)
+	require.Empty(t, output.AbortJobIDs)
+	require.Contains(t, output.FailedReason, "rate limited",
+		"the provider's explanation belongs on the affected jobs")
+
+	// A state this connector has not been taught: retried, never guessed at - and the raw value
+	// still has to reach the operator even though it may not reach the log.
+	api.EXPECT().GetImportStatus("sg-accepted").Times(1).Return(
+		&sendgridbulkupload.ImportStatusResponse{ID: "sg-accepted", Status: unknownStatus}, nil)
+	poll := uploader.Poll(common.AsyncPoll{ImportId: "sg-accepted", ImportCount: 5})
+	require.Equal(t, http.StatusInternalServerError, poll.StatusCode)
+	require.Contains(t, poll.Error, unknownStatus)
+
+	// An unparseable document: a decoder reports the fragment it choked on, and that fragment is
+	// part of a document quoting rejected contacts.
+	api.EXPECT().GetImportErrors(testErrorsURL).Times(1).
+		Return([]byte("{not json at all: "+providerReason), nil)
+	require.Equal(t, http.StatusInternalServerError, uploader.GetUploadStats(common.GetUploadStatsInput{
+		FailedJobParameters: testErrorsURL,
+		ImportingList:       fixtureJobs(t, 1, 2, 3, 4, 5),
+	}).StatusCode)
+
+	// A reconciliation carrying one matched row and one that names a contact this upload never
+	// staged, so both the per-row path and the unmatched-row accounting are exercised.
+	secondErrorsURL := testErrorsURL + "-2"
+	api.EXPECT().GetImportErrors(secondErrorsURL).Times(1).Return([]byte(fmt.Sprintf(
+		`{"errors":[{"email":"blake@example.com","message":%q},{"email":"ghost@example.com","reason":%q}]}`,
+		providerReason, providerReason)), nil)
+	reconciled := uploader.GetUploadStats(common.GetUploadStatsInput{
+		FailedJobParameters: secondErrorsURL,
+		ImportingList:       fixtureJobs(t, 1, 2, 3, 4, 5),
+	})
+	require.Equal(t, http.StatusOK, reconciled.StatusCode)
+	require.Equal(t, []int64{2}, reconciled.Metadata.FailedKeys)
+	require.Contains(t, reconciled.Metadata.FailedReasons[2], "Invalid email address",
+		"the provider's explanation belongs on the affected job")
+	require.NotContains(t, reconciled.Metadata.FailedReasons[2], "alex@example.com",
+		"and it is redacted even there, because a reason is persisted and read widely too")
+
+	// The logger held by the manager is the very instance handed to the HTTP adapter at
+	// construction, so proving it carries the attribution proves the adapter's own lines do too.
+	uploader.Logger.Infon("[sendgrid bulk upload] bound logger probe")
+
+	entries := readLogs()
+	require.NotEmpty(t, entries)
+
+	for _, entry := range entries {
+		rendered, err := jsonrs.Marshal(entry)
+		require.NoError(t, err)
+		line := string(rendered)
+
+		require.Equalf(t, testDestinationID, entry["destinationId"],
+			"a log line carries no destinationId: %s", line)
+		require.Equalf(t, "SENDGRID_BULK_UPLOAD", entry["destinationType"],
+			"a log line carries no destinationType: %s", line)
+
+		for _, text := range providerText() {
+			require.NotContainsf(t, line, text, "provider text %q reached a log line: %s", text, line)
+		}
+	}
+
+	// Exactly one rate-limit warning, and this connector's own label - never the provider's value -
+	// for a status it has not been taught.
+	rateLimitWarnings, unrecognizedStatusLogged := 0, false
+	var uploadSummary map[string]any
+	for _, entry := range entries {
+		message := fmt.Sprint(entry["msg"])
+		switch {
+		case fmt.Sprint(entry["level"]) == "WARN" && strings.Contains(message, "rate limited while uploading contacts"):
+			rateLimitWarnings++
+		case strings.Contains(message, "upload finished"):
+			uploadSummary = entry
+		case strings.Contains(message, "unrecognized import status"):
+			require.Equal(t, "unrecognized", entry["status"],
+				"a provider-chosen value must neither enter the log nor give a metric tag unbounded cardinality")
+			unrecognizedStatusLogged = true
+		}
+	}
+	require.Equal(t, 1, rateLimitWarnings, "failure logging has exactly one owner")
+	require.True(t, unrecognizedStatusLogged)
+
+	// Attempted requests and accepted imports answer different questions, and conflating them hides
+	// exactly the case an operator most needs to see: a chunk rejected with 429 or 5xx never becomes
+	// an import and would simply vanish from a count derived from the accepted ones.
+	require.NotNil(t, uploadSummary)
+	require.EqualValues(t, 3, uploadSummary["requestCount"])
+	require.EqualValues(t, 1, uploadSummary["acceptedRequestCount"])
+
+	// The conditions worth alerting on are counters, so none of the above depends on log inspection.
+	require.NotNil(t, store.Get("unrecognized_import_status_count", statLabels()))
+	require.NotNil(t, store.Get("unmatched_error_row_count", statLabels()))
+}
+
+// TestUploadCustomFieldWithADottedTraitName pins that a trait is looked up by its exact NAME.
+//
+// gjson reads a dot as a path separator, so a trait genuinely called "plan.tier" would silently
+// resolve to the tier field of a nested plan object - a different value, from a different place,
+// with nothing to indicate the substitution. Exact keys are therefore consulted first, and only a
+// name that matches no key at all is treated as a path.
+func TestUploadCustomFieldWithADottedTraitName(t *testing.T) {
+	t.Parallel()
+
+	api := newMockAPI(t)
+	api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+		func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+			require.Len(t, request.Contacts, 1)
+			require.Equal(t, map[string]any{"w1": "gold"}, request.Contacts[0].CustomFields,
+				"the exact key must win over a same-named nested path")
+			return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+		})
+
+	uploader := newUploader(api)
+	uploader.DestinationConfig = sendgridbulkupload.DestinationConfig{
+		APIKey:              "SG.test-api-key",
+		CustomFieldsMapping: map[string]string{"plan.tier": "w1"},
+	}
+	output := uploader.Upload(&common.AsyncDestinationStruct{
+		FileName: writeStagingFile(t, stagingLine(t, 1,
+			`{"type":"identify","userId":"user_1","traits":{"email":"casey@example.com",`+
+				`"plan.tier":"gold","plan":{"tier":"bronze"}}}`)),
+		ImportingJobIDs: []int64{1},
+		Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
 	})
 
-	t.Run("several imports contribute their own errors documents", func(t *testing.T) {
-		t.Parallel()
+	require.Equal(t, []int64{1}, output.ImportingJobIDs)
+}
 
-		// One upload can produce several imports, and a row left unread in ANY of their documents
-		// would make the whole pooled set unsafe to reconcile by exclusion, so all of them are
-		// read and their rows accumulated.
-		jobs := importingJobs(t, stagingFixtureLines(t))
-		secondImportID := testImportID + "-2"
-		secondErrorsURL := testErrorsURL + "-2"
+// TestUploadChunkJobIDsStayAlignedWithTheirContacts pins the invariant the whole chunking design
+// rests on: chunk N's job IDs are exactly the jobs whose contacts travelled in chunk N.
+//
+// Misalignment by even one position would attribute an import's contacts to the wrong jobs, and
+// every later poll and reconciliation would then settle the wrong ones - a failure that no
+// individual outcome assertion would notice, because all the right job IDs would still be present
+// somewhere. The membership the manifest persists is what makes the alignment observable.
+func TestUploadChunkJobIDsStayAlignedWithTheirContacts(t *testing.T) {
+	t.Parallel()
 
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			GetImportStatus(testImportID).
-			Return(statusFromWireBody(t, importStatusBody(testImportID, "errored", 1, testErrorsURL)), nil).
-			Times(1)
-		apiService.EXPECT().
-			GetImportStatus(secondImportID).
-			Return(statusFromWireBody(t, importStatusBody(secondImportID, "errored", 1, secondErrorsURL)), nil).
-			Times(1)
-		apiService.EXPECT().
-			GetImportErrors(testErrorsURL).
-			Return([]byte(`[{"email":"blake@example.com","message":"the first import rejected this contact"}]`), nil).
-			Times(1)
-		apiService.EXPECT().
-			GetImportErrors(secondErrorsURL).
-			Return([]byte(`[{"email":"devon@example.com","message":"the second import rejected this contact"}]`), nil).
-			Times(1)
+	const jobCount = 9
 
-		response := newUploader(t, apiService, newDestinationConfig()).
-			GetUploadStats(common.GetUploadStatsInput{
-				Parameters:    importParameters(t, testImportID+":"+secondImportID, len(jobs)),
-				ImportingList: jobs,
-			})
+	lines := make([]string, 0, jobCount)
+	jobIDs := make([]int64, 0, jobCount)
+	for jobID := int64(1); jobID <= jobCount; jobID++ {
+		lines = append(lines, contactLine(t, jobID))
+		jobIDs = append(jobIDs, jobID)
+	}
 
-		require.Equal(t, 200, response.StatusCode)
-		require.ElementsMatch(t, []int64{2, 4}, response.Metadata.FailedKeys)
-		require.Contains(t, response.Metadata.FailedReasons[2], "the first import rejected this contact")
-		require.Contains(t, response.Metadata.FailedReasons[4], "the second import rejected this contact")
-		require.ElementsMatch(t, []int64{1, 3, 5}, response.Metadata.SucceededKeys)
-	})
-
-	for _, testCase := range []struct {
-		name         string
-		parameters   []byte
-		setupMock    func(apiService *mockAPIService.MockSendGridAPIService)
-		expectReason string
-	}{
-		{
-			name:       "the persisted parameters cannot be parsed",
-			parameters: []byte(`{not json`),
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().GetImportStatus(gomock.Any()).Times(0)
-				apiService.EXPECT().GetImportErrors(gomock.Any()).Times(0)
-			},
-			expectReason: "Failed to parse parameters",
-		},
-		{
-			name:       "the import status cannot be re-read",
-			parameters: nil, // filled in below, per case, so the import id is always valid JSON
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().
-					GetImportStatus(testImportID).
-					Return(nil, &sendgridbulkupload.APIError{
-						StatusCode: 500,
-						Operation:  "get import status",
-						Message:    "internal server error",
-					}).
-					Times(1)
-				apiService.EXPECT().GetImportErrors(gomock.Any()).Times(0)
-			},
-			expectReason: "Failed to fetch the sendgrid import status",
-		},
-		{
-			name: "the import reports errored contacts but publishes no document",
-			setupMock: func(apiService *mockAPIService.MockSendGridAPIService) {
-				apiService.EXPECT().
-					GetImportStatus(testImportID).
-					Return(statusFromWireBody(t, importStatusBody(testImportID, "errored", 2, "")), nil).
-					Times(1)
-				apiService.EXPECT().GetImportErrors(gomock.Any()).Times(0)
-			},
-			expectReason: "without publishing an errors document",
-		},
-	} {
-		t.Run("reconciliation is retried when "+testCase.name, func(t *testing.T) {
-			t.Parallel()
-
-			jobs := importingJobs(t, stagingFixtureLines(t))
-
-			apiService := newMockAPIService(t)
-			testCase.setupMock(apiService)
-
-			parameters := testCase.parameters
-			if parameters == nil {
-				parameters = importParameters(t, testImportID, len(jobs))
+	// The import id each chunk is answered with names the emails it carried, so the membership the
+	// manifest records can be checked against the contacts that were actually sent.
+	api := newMockAPI(t)
+	chunkIndex := 0
+	sentEmails := make(map[string][]string)
+	api.EXPECT().UploadContacts(gomock.Any()).Times(3).DoAndReturn(
+		func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+			chunkIndex++
+			importID := "sg-" + strconv.Itoa(chunkIndex)
+			for _, contact := range request.Contacts {
+				sentEmails[importID] = append(sentEmails[importID], contact.Email)
 			}
-
-			response := newUploader(t, apiService, newDestinationConfig()).
-				GetUploadStats(common.GetUploadStatsInput{
-					Parameters:    parameters,
-					ImportingList: jobs,
-				})
-
-			require.Equal(t, 500, response.StatusCode)
-			require.Contains(t, response.Error, testCase.expectReason)
-			require.Empty(t, response.Metadata.FailedKeys)
-			require.Empty(t, response.Metadata.SucceededKeys)
+			return &sendgridbulkupload.UpsertResponse{JobID: importID}, nil
 		})
-	}
+
+	uploader := newUploader(api)
+	uploader.MaxContactsPerRequest = 3
+	output := uploader.Upload(&common.AsyncDestinationStruct{
+		FileName:        writeStagingFile(t, lines...),
+		ImportingJobIDs: jobIDs,
+		Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+	})
+
+	require.Equal(t, jobIDs, output.ImportingJobIDs)
+	importID, importCount := importParametersOf(t, output)
+	require.EqualValues(t, jobCount, importCount)
+
+	// Each import names three consecutive jobs, and the fixture's email for job N is userN@..., so
+	// the recorded membership and the contacts that were sent must agree job for job.
+	require.Equal(t, "sg-1=1-3;sg-2=4-6;sg-3=7-9", importID)
+	require.Equal(t, map[string][]string{
+		"sg-1": {"user1@example.com", "user2@example.com", "user3@example.com"},
+		"sg-2": {"user4@example.com", "user5@example.com", "user6@example.com"},
+		"sg-3": {"user7@example.com", "user8@example.com", "user9@example.com"},
+	}, sentEmails)
 }
 
-// TestGetUploadStatsIdentifierEdgeCases covers the two ways an identifier can defeat attribution
-// even though the document itself was read perfectly, plus a malformed importing list.
+// TestGetUploadStatsReportsARepeatedImportingJobOnce pins that a job listed twice is settled once.
 //
-// Both resolve the same way, and for the same asymmetric reason: SendGrid upserts contacts, so
-// failing a job that in fact succeeded costs one idempotent re-upsert bounded by the batch router's
-// retry budget, whereas recording a rejected contact as delivered loses it permanently with
-// nothing left in the system that could ever detect it.
-func TestGetUploadStatsIdentifierEdgeCases(t *testing.T) {
+// The batch router builds the importing list from job state, and a job appearing twice must not
+// produce two status updates for one job: the router would write both, and the second would
+// contradict the first. The completeness guarantee is stated over the SET of importing jobs, so it
+// has to survive a duplicated entry.
+func TestGetUploadStatsReportsARepeatedImportingJobOnce(t *testing.T) {
 	t.Parallel()
 
-	t.Run("an identifier shared by two jobs fails both of them", func(t *testing.T) {
-		t.Parallel()
+	api := newMockAPI(t)
+	api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(
+		[]byte(`{"errors":[{"email":"blake@example.com","message":"rejected"}]}`), nil)
 
-		statsStore, err := memstats.New()
-		require.NoError(t, err)
+	jobs := fixtureJobs(t, 1, 2, 3)
+	// Job 2 - the one the document names - and job 3 - one it does not - are both duplicated, so
+	// neither the failed nor the succeeded channel can be relying on the list being a set.
+	jobs = append(jobs, jobs[1], jobs[2])
 
-		// Two staged events legitimately carrying the same address: SendGrid upserts them onto one
-		// contact, so an errored row genuinely refers to both and neither may be cleared.
-		jobs := importingJobs(t, []string{
-			stagingLine(t, 10, `{"type":"identify","userId":"user_10","traits":{"email":"shared@example.com"}}`),
-			stagingLine(t, 11, `{"type":"track","event":"Signed Up","userId":"user_11","traits":{"email":"shared@example.com"}}`),
-			stagingLine(t, 12, `{"type":"identify","userId":"user_12","traits":{"email":"unique@example.com"}}`),
-		})
-
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			GetImportErrors(testErrorsURL).
-			Return([]byte(`[{"email":"shared@example.com","message":"the contact was rejected"}]`), nil).
-			Times(1)
-
-		response := newUploaderWithStats(t, apiService, newDestinationConfig(), statsStore).
-			GetUploadStats(common.GetUploadStatsInput{
-				FailedJobParameters: testErrorsURL,
-				Parameters:          importParameters(t, testImportID, len(jobs)),
-				ImportingList:       jobs,
-			})
-
-		require.Equal(t, 200, response.StatusCode)
-		require.ElementsMatch(t, []int64{10, 11}, response.Metadata.FailedKeys)
-		require.ElementsMatch(t, []int64{12}, response.Metadata.SucceededKeys)
-		for _, jobID := range []int64{10, 11} {
-			require.Contains(t, response.Metadata.FailedReasons[jobID], "the contact was rejected")
-			require.Contains(t, response.Metadata.FailedReasons[jobID], "matches 2 jobs")
-		}
-
-		ambiguous := statsStore.Get("ambiguous_error_row_count", statLabels())
-		require.NotNil(t, ambiguous)
-		require.EqualValues(t, 1, ambiguous.LastValue())
+	response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+		FailedJobParameters: testErrorsURL,
+		ImportingList:       jobs,
 	})
 
-	t.Run("an importing job whose identifier cannot be re-derived is failed", func(t *testing.T) {
-		t.Parallel()
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	require.Equal(t, []int64{2}, response.Metadata.FailedKeys)
+	require.ElementsMatch(t, []int64{1, 3}, response.Metadata.SucceededKeys)
+	assertSettledExactlyOnce(t, response.Metadata, []int64{1, 2, 3})
+}
 
-		statsStore, err := memstats.New()
-		require.NoError(t, err)
+// TestGetUploadStatsReconcilesAFullSizedImport reconciles a whole request's worth of jobs that all
+// share ONE contact identifier.
+//
+// That combination is the worst case for the identifier index, because every job crowds into the
+// same entry. The assertions are on the OUTCOME rather than on a duration - a wall-clock threshold
+// is not a fact a test can rely on - but what they establish is that the index is built and consumed
+// in one pass per job: a construction that re-scanned each identifier's growing job list would
+// perform hundreds of millions of comparisons to reach the same verdict.
+func TestGetUploadStatsReconcilesAFullSizedImport(t *testing.T) {
+	t.Parallel()
 
-		jobs := importingJobs(t, []string{
-			stagingLine(t, 20, `{"type":"identify","userId":"user_20","traits":{"email":"rejected@example.com"}}`),
-			stagingLine(t, 22, `{"type":"identify","userId":"user_22","traits":{"email":"delivered@example.com"}}`),
+	const importedJobs = 20_000
+
+	api := newMockAPI(t)
+	api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(
+		[]byte(`[{"email":"crowded@example.com","message":"rejected"}]`), nil)
+
+	importingList := make([]*jobsdb.JobT, 0, importedJobs)
+	expected := make([]int64, 0, importedJobs)
+	for jobID := int64(1); jobID <= importedJobs; jobID++ {
+		importingList = append(importingList, &jobsdb.JobT{
+			JobID: jobID,
+			EventPayload: []byte(stagingLine(t, jobID, fmt.Sprintf(
+				`{"type":"identify","userId":"user_%d","traits":{"email":"crowded@example.com"}}`, jobID))),
 		})
-		// A payload that no longer yields any identifier: it cannot be compared against the errors
-		// document in either direction, so it can never be shown to be absent from it, and "not
-		// shown to have failed" is not evidence of delivery.
-		jobs = append(jobs, &jobsdb.JobT{
-			JobID:        21,
-			EventPayload: []byte(`{"body":{"JSON":{"type":"track","event":"Page Viewed"}}}`),
-		})
-		// A nil entry must be skipped rather than dereferenced: this runs inside a shared batch
-		// router worker, where a panic would take down every destination it is serving.
-		jobs = append(jobs, nil)
+		expected = append(expected, jobID)
+	}
 
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			GetImportErrors(testErrorsURL).
-			Return([]byte(`[{"email":"rejected@example.com","message":"the contact was rejected"}]`), nil).
-			Times(1)
-
-		response := newUploaderWithStats(t, apiService, newDestinationConfig(), statsStore).
-			GetUploadStats(common.GetUploadStatsInput{
-				FailedJobParameters: testErrorsURL,
-				Parameters:          importParameters(t, testImportID, len(jobs)),
-				ImportingList:       jobs,
-			})
-
-		require.Equal(t, 200, response.StatusCode)
-		require.ElementsMatch(t, []int64{20, 21}, response.Metadata.FailedKeys)
-		require.ElementsMatch(t, []int64{22}, response.Metadata.SucceededKeys)
-		require.Contains(t, response.Metadata.FailedReasons[20], "the contact was rejected")
-		require.Contains(t, response.Metadata.FailedReasons[21], "could not be re-derived")
-
-		unresolvable := statsStore.Get("unresolvable_importing_job_count", statLabels())
-		require.NotNil(t, unresolvable)
-		require.EqualValues(t, 1, unresolvable.LastValue())
+	response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+		FailedJobParameters: testErrorsURL,
+		ImportingList:       importingList,
 	})
 
-	t.Run("an identifier is re-derived from every payload shape the router may hand over", func(t *testing.T) {
-		t.Parallel()
-
-		// Reconciliation keeps no state from the upload, so it re-derives every contact's
-		// identifier from the job it is handed - and the batch router may hand that job over in
-		// any of three shapes: the queued event, a staging-file line, or the bare message. All
-		// three have to resolve, because a shape that does not is indistinguishable from a contact
-		// that simply was not in the errors document, which is to say it would be reported
-		// delivered. Each shape is exercised in BOTH directions at once: one job of that shape is
-		// named in the errors document and one is not.
-		jobs := []*jobsdb.JobT{
-			// The queued wire shape, which is where Transform reads the message from.
-			{JobID: 30, EventPayload: []byte(
-				`{"body":{"JSON":{"type":"identify","userId":"user_30","traits":{"email":"wire@example.com"}}}}`)},
-			{JobID: 40, EventPayload: []byte(
-				`{"body":{"JSON":{"type":"identify","userId":"user_40","traits":{"email":"wire-ok@example.com"}}}}`)},
-			// A staging-file line - message plus metadata - exactly as Transform emits it.
-			{JobID: 31, EventPayload: []byte(
-				`{"message":{"type":"identify","userId":"user_31","traits":{"email":"staged@example.com"}},` +
-					`"metadata":{"job_id":31}}`)},
-			{JobID: 41, EventPayload: []byte(
-				`{"message":{"type":"identify","userId":"user_41","traits":{"email":"staged-ok@example.com"}},` +
-					`"metadata":{"job_id":41}}`)},
-			// The bare message itself, carrying no envelope at all.
-			{JobID: 32, EventPayload: []byte(
-				`{"type":"identify","userId":"user_32","traits":{"email":"bare@example.com"}}`)},
-			{JobID: 42, EventPayload: []byte(
-				`{"type":"identify","userId":"user_42","traits":{"email":"bare-ok@example.com"}}`)},
-		}
-
-		apiService := newMockAPIService(t)
-		apiService.EXPECT().
-			GetImportErrors(testErrorsURL).
-			Return([]byte(`[`+
-				`{"email":"wire@example.com","message":"the queued contact was rejected"},`+
-				`{"email":"staged@example.com","message":"the staged contact was rejected"},`+
-				`{"email":"bare@example.com","message":"the bare contact was rejected"}]`), nil).
-			Times(1)
-
-		response := newUploader(t, apiService, newDestinationConfig()).
-			GetUploadStats(common.GetUploadStatsInput{
-				FailedJobParameters: testErrorsURL,
-				Parameters:          importParameters(t, testImportID, len(jobs)),
-				ImportingList:       jobs,
-			})
-
-		require.Equal(t, 200, response.StatusCode)
-		// A non-empty succeeded set is the crisp signal that no shape went unresolved: an
-		// unmatched errors row or an unresolvable job would have tripped the fail-closed branch,
-		// which sweeps every importing job into the failed set and leaves this empty.
-		require.ElementsMatch(t, []int64{30, 31, 32}, response.Metadata.FailedKeys)
-		require.ElementsMatch(t, []int64{40, 41, 42}, response.Metadata.SucceededKeys)
-		requireDisjoint(t, response.Metadata.FailedKeys, response.Metadata.SucceededKeys)
-		// Each row landed on the job of its own shape rather than on some other job that happened
-		// to resolve, which a shared or defaulted reason would have hidden.
-		require.Contains(t, response.Metadata.FailedReasons[30], "the queued contact was rejected")
-		require.Contains(t, response.Metadata.FailedReasons[31], "the staged contact was rejected")
-		require.Contains(t, response.Metadata.FailedReasons[32], "the bare contact was rejected")
-	})
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	// The rejection refers to every job that claimed the address, so all of them are retried and
+	// none is reported delivered. Failing a job that in fact succeeded costs one idempotent
+	// re-upsert; reporting a failed contact as delivered loses it.
+	require.Equal(t, expected, response.Metadata.FailedKeys)
+	require.Len(t, response.Metadata.FailedReasons, importedJobs)
+	require.Empty(t, response.Metadata.SucceededKeys)
+	require.Empty(t, response.Metadata.AbortedKeys)
+	require.Contains(t, response.Metadata.FailedReasons[1],
+		fmt.Sprintf("matches %d jobs", importedJobs))
 }

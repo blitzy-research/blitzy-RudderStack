@@ -62,6 +62,14 @@ type DestinationConfig struct {
 	// field to exist before any value can be written to it and addresses it by ID rather
 	// than by name. Inventing field names would therefore produce nothing but rejected
 	// requests, so a trait with no entry here is not sent as a custom field at all.
+	//
+	// The field is VALIDATED AND NORMALIZED at construction by
+	// validateCustomFieldsMapping, so by the time any uploader reads it every key and every
+	// value is trimmed and non-blank, and no two keys share a value. A mapping that breaks
+	// any of those rules fails NewManager instead of being applied: a blank field ID would
+	// have SendGrid reject every contact in every batch, and two traits claiming one field ID
+	// would resolve by Go's randomized map iteration order, delivering a different value on
+	// each run while looking perfectly healthy. It is optional and may be nil or empty.
 	CustomFieldsMapping map[string]string `json:"customFieldsMapping"`
 }
 
@@ -467,15 +475,18 @@ type SendGridBulkUploader struct {
 	// router, which keys its bookkeeping on it.
 	DestinationID string
 
-	// DestinationName is the destination's human-readable name, used only as log context.
-	//
-	// The destType stats tag must come from the destName constant instead of from this
-	// field, so that the tag can never drift from the registered destination-definition
-	// name even if an operator renames the destination.
-	DestinationName string
-
 	// DestinationConfig is the parsed destination configuration: the API key, the target
 	// list IDs and the trait-to-custom-field mapping.
+	//
+	// It is the single source of truth for every configured value, including the bearer
+	// credential: the HTTP adapter is constructed FROM this parsed view rather than re-reading
+	// the untyped configuration map, so the two readings cannot disagree.
+	//
+	// The destination's human-readable name is deliberately NOT kept here or on this struct. The
+	// destType stats tag and every log line identify this connector through the destName
+	// constant, so that they can never drift from the registered destination-definition name even
+	// if an operator renames the destination, and an operator-facing name that nothing reads
+	// would be dead state.
 	DestinationConfig DestinationConfig
 
 	// SendGridAPIService performs the three SendGrid calls. It is held as the interface
@@ -487,8 +498,29 @@ type SendGridBulkUploader struct {
 	// endpoint's documented ceiling of 30,000.
 	MaxContactsPerRequest int // Override for testing (0 = use default)
 
-	// MaxRequestBytes caps the serialized size of one upsert body, budgeted below the
-	// endpoint's documented 6MB ceiling so that the envelope and the list IDs fit inside it
-	// too.
+	// MaxRequestBytes caps the serialized size of one upsert body IN FULL: the
+	// {"list_ids":[...],"contacts":[...]} envelope, every list ID inside it, every contact
+	// and every separating comma, all charged against the endpoint's documented 6MB ceiling.
+	//
+	// The envelope's exact cost is measured per request and deducted from this budget before
+	// any contact is packed, so nothing is reserved for by guesswork and nothing is charged
+	// twice.
 	MaxRequestBytes int // Override for testing (0 = use default)
+
+	// MaxBufferCapacity caps how large a single staging-file line may be.
+	//
+	// Its default is DERIVED from MaxRequestBytes rather than picked, because a limit below the
+	// request budget would fail a whole batch on a record the chunker could otherwise have
+	// rejected on its own. An unusable value - zero or negative - is normalized to that default
+	// rather than reaching bufio.Scanner, where it would make every line unreadable.
+	MaxBufferCapacity int // Override for testing (0 = use default)
+
+	// MaxImportsPerUpload caps how many SendGrid imports one upload may create, and therefore the
+	// worst-case number of status requests each later poll of that upload can cost.
+	//
+	// It is a POLL budget set at upload time, because Poll cannot bound its own work: it persists
+	// no cursor, so it could not resume where a previous poll stopped. Chunks beyond the cap are
+	// not sent and their jobs are reported as retryable, so an oversized batch drains over
+	// consecutive batches instead of issuing an unbounded number of requests.
+	MaxImportsPerUpload int // Override for testing (0 = use default)
 }
