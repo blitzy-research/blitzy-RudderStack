@@ -149,10 +149,11 @@ const externalIDTypeListIDs = "listIds"
 
 // Reasons recorded against jobs this connector rejects locally, before any request is made.
 //
-// Both conditions are PERMANENT: the batch router would rebuild an identical payload on a
+// All three conditions are PERMANENT: the batch router would rebuild an identical payload on a
 // retry, so retrying could only ever fail again and would burn the retry budget for nothing.
-// They are therefore the only outcomes in this connector that use the terminal abort channel
-// - a rate limit never does.
+// They are therefore the ONLY outcomes in this connector that use the terminal abort channel,
+// and each of them abandons exactly one job. No response SendGrid returns is terminal - not a
+// rate limit, and not a rejected request either: the batch router owns the decision to give up.
 const (
 	// reasonMissingIdentifier is recorded when an event yields a contact carrying none of
 	// the four identifiers SendGrid accepts.
@@ -212,7 +213,18 @@ var _ common.AsyncDestinationManager = (*SendGridBulkUploader)(nil)
 // Construction FAILS rather than returning a half-configured manager. In particular a
 // destination with no API key is rejected here, once and clearly, instead of being allowed
 // to produce an opaque 401 on every batch for as long as it stays misconfigured.
-func NewManager(logger logger.Logger, statsFactory stats.Stats, destination *backendconfig.DestinationT) (*SendGridBulkUploader, error) {
+//
+// Observability, by contrast, is DEFAULTED rather than demanded: a nil logger or a nil stats
+// factory falls back to the no-op implementation, exactly as the API service constructor
+// already does. The factory always supplies both, so this is not a path production takes - but
+// the two constructors must not disagree about it, and a caller that has not wired up
+// observability yet deserves a working manager rather than a nil-pointer panic inside a router
+// worker (or, worse, one deferred to the first upload).
+//
+// The logger parameter is named log rather than logger so that it does not shadow the logger
+// package this fallback needs. The function's type is unchanged, and the factory calls it
+// positionally.
+func NewManager(log logger.Logger, statsFactory stats.Stats, destination *backendconfig.DestinationT) (*SendGridBulkUploader, error) {
 	if destination == nil {
 		return nil, fmt.Errorf("destination is nil")
 	}
@@ -220,8 +232,14 @@ func NewManager(logger logger.Logger, statsFactory stats.Stats, destination *bac
 	if err != nil {
 		return nil, err
 	}
+	if log == nil {
+		log = logger.NOP
+	}
+	if statsFactory == nil {
+		statsFactory = stats.NOP
+	}
 
-	sendGridLogger := logger.Child("SendGridBulkUpload").Child("SendGridBulkUploader")
+	sendGridLogger := log.Child("SendGridBulkUpload").Child("SendGridBulkUploader")
 
 	// The API key guard lives in the API service constructor, which is the single place that
 	// owns the bearer credential; its error is propagated verbatim so the reason a
@@ -710,10 +728,15 @@ func chunkBySizeAndElements(contacts []Contact, jobIDs []int64, maxBytes, maxEle
 // The staging file is read, the contacts are grouped by target list and chunked against both
 // request caps, and one PUT is issued per chunk. Every accepted chunk contributes its job_id
 // to the import identifier the batch router persists and its job IDs to the importing set;
-// every rejected chunk contributes its job IDs to the retryable or the terminal set,
-// according to why it was rejected.
+// a chunk SendGrid rejected contributes its job IDs to the retryable set, whatever the status
+// code, because the framework owns the decision to give up. Only the local per-record
+// rejections - a contact with none of SendGrid's identifiers, a malformed staging record, a
+// contact too large for any request - are terminal, and each aborts just its own job.
 //
-// The three outcome sets are kept DISJOINT, so a job is only ever reported once.
+// The three outcome sets are kept DISJOINT, so a job is only ever reported once, and together
+// they account for EVERY job in the batch: a job the staging file turned out not to contain is
+// swept into the retryable set rather than left with no outcome at all, because the batch router
+// writes a status only for the jobs an upload names.
 //
 // A rate limit is never terminal. When SendGrid answers 429 the affected jobs are returned as
 // retryable failures with the advertised reset window in the reason, and never as aborts: the
@@ -803,14 +826,11 @@ func (b *SendGridBulkUploader) Upload(asyncDestStruct *common.AsyncDestinationSt
 				Contacts: contactChunk,
 			})
 			if err != nil {
-				terminal, reason := b.classifyUploadError(err, destinationID, len(jobIDChunks[idx]))
-				if terminal {
-					abortedJobIDs = append(abortedJobIDs, jobIDChunks[idx]...)
-					abortReasons = append(abortReasons, reason)
-				} else {
-					failedJobIDs = append(failedJobIDs, jobIDChunks[idx]...)
-					failureReasons = append(failureReasons, reason)
-				}
+				// Retryable whatever SendGrid answered: the batch router owns the retry budget
+				// and escalates to an abort itself once it is spent, so one rejected request
+				// can never terminally discard a whole chunk of jobs here.
+				failedJobIDs = append(failedJobIDs, jobIDChunks[idx]...)
+				failureReasons = append(failureReasons, b.classifyUploadError(err, destinationID, len(jobIDChunks[idx])))
 				continue
 			}
 			if uploadResp == nil || strings.TrimSpace(uploadResp.JobID) == "" {
@@ -865,6 +885,28 @@ func (b *SendGridBulkUploader) Upload(asyncDestStruct *common.AsyncDestinationSt
 	// still holds after the import-parameter fallback above has moved jobs between sets.
 	failedJobIDs, _ = lo.Difference(lo.Uniq(failedJobIDs), output.ImportingJobIDs)
 	abortedJobIDs, _ = lo.Difference(lo.Uniq(abortedJobIDs), lo.Union(output.ImportingJobIDs, failedJobIDs))
+
+	// Completeness sweep: the batch router writes a status ONLY for the jobs this output names,
+	// so a job in the batch that landed in none of the three sets would silently receive no
+	// status at all and never be resolved. That should not happen - the router derives the batch
+	// from the very lines it wrote - but "should not happen" is exactly the kind of assumption
+	// that leaves jobs stranded when a staging file is truncated, or holds nothing but blank
+	// lines, so the gap is closed explicitly rather than assumed away. The sweep is retryable,
+	// because a missing line says nothing permanent about the job that produced it, and it is
+	// disjoint from the other three sets by construction.
+	if unaccountedJobIDs, _ := lo.Difference(
+		lo.Uniq(asyncDestStruct.ImportingJobIDs),
+		lo.Union(output.ImportingJobIDs, failedJobIDs, abortedJobIDs),
+	); len(unaccountedJobIDs) > 0 {
+		b.Logger.Errorn("[sendgrid bulk upload] jobs in the batch were not present in the staging file",
+			obskit.DestinationID(destinationID),
+			logger.NewStringField("fileName", asyncDestStruct.FileName),
+			logger.NewIntField("unaccountedCount", int64(len(unaccountedJobIDs))))
+		failedJobIDs = append(failedJobIDs, unaccountedJobIDs...)
+		failureReasons = append(failureReasons, fmt.Sprintf(
+			"BRT: %d job(s) in this batch were not present in the staging file and could not be uploaded",
+			len(unaccountedJobIDs)))
+	}
 	// An outcome nothing landed in is reported as absent rather than as a present-but-empty
 	// slice, so that "no job was rate limited" and "no job was aborted" read identically to a
 	// caller however it inspects the result.
@@ -896,19 +938,35 @@ func (b *SendGridBulkUploader) Upload(asyncDestStruct *common.AsyncDestinationSt
 	return output
 }
 
-// classifyUploadError decides whether one rejected chunk's jobs are retryable or terminal, and
-// renders the reason recorded against them.
+// classifyUploadError logs one rejected chunk's failure and renders the retryable reason
+// recorded against that chunk's jobs.
 //
 // A rate limit is ALWAYS retryable - that is the whole point of the API service returning a
 // dedicated type for it - and is deliberately never reported as terminal, no matter how
-// exhausted the window is.
+// exhausted the window is. It is told apart from every other failure here only so that the
+// advertised reset window reaches the operator-facing reason and the log line is a warning
+// rather than an error.
 //
-// A 400 Bad Request or a 413 Payload Too Large is terminal, because the batch router would
-// rebuild a byte-identical body on a retry: SendGrid has already judged that body
-// unacceptable, so retrying it could only fail again while consuming the retry budget. Every
-// other status - an authorization failure an operator can fix, a 5xx, a transport error, a
-// timeout - is retryable, and the batch router decides when to give up.
-func (b *SendGridBulkUploader) classifyUploadError(err error, destinationID string, chunkJobCount int) (bool, string) {
+// In fact NO provider response is terminal here, and that is deliberate. A 400 naming one
+// unacceptable contact says nothing about the other contacts in the same chunk, and a chunk
+// holds up to 30,000 of them: aborting on it would terminally discard every one of those jobs
+// on the strength of a single bad record. A 413 says the request was too large, which the batch
+// router's own re-batching may well resolve. So every provider failure - 400, 413, an
+// authorization failure an operator can fix, a 5xx, a transport error, a timeout - goes to the
+// RETRYABLE channel, and the batch router alone decides when to give up: it escalates to an
+// abort once its retry budget is exhausted, which is the framework's job and not this
+// connector's.
+//
+// The only terminal outcomes in this connector are the LOCAL per-record rejections raised before
+// any request is made - a contact carrying none of SendGrid's four identifiers, a malformed
+// staging record, a contact too large for any request. Those are permanent by construction, and
+// they abort exactly one job each rather than a whole chunk.
+//
+// The status code is surfaced as its own log field so an operator can tell a malformed body from
+// an authorization failure from a provider outage without parsing the message. Because every
+// outcome is retryable, the method returns only the reason: there is no terminal branch for a
+// caller to act on.
+func (b *SendGridBulkUploader) classifyUploadError(err error, destinationID string, chunkJobCount int) string {
 	var rateLimitErr *RateLimitError
 	if errors.As(err, &rateLimitErr) {
 		// The reset window, the limit and the remaining quota are all rendered by the error
@@ -922,22 +980,23 @@ func (b *SendGridBulkUploader) classifyUploadError(err error, destinationID stri
 			logger.NewIntField("rateLimitLimit", int64(rateLimitErr.Limit)),
 			logger.NewIntField("rateLimitRemaining", int64(rateLimitErr.Remaining)),
 			logger.NewIntField("chunkJobCount", int64(chunkJobCount)))
-		return false, reason
+		return reason
 	}
 
+	// Zero when the failure never reached SendGrid at all - a transport error or a timeout -
+	// which is itself diagnostic.
+	var statusCode int64
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		statusCode = int64(apiErr.StatusCode)
+	}
 	b.Logger.Errorn("[sendgrid bulk upload] unable to upload contacts",
 		obskit.Error(err),
 		obskit.DestinationID(destinationID),
+		logger.NewIntField("statusCode", statusCode),
 		logger.NewIntField("chunkJobCount", int64(chunkJobCount)))
 
-	var apiErr *APIError
-	if errors.As(err, &apiErr) {
-		switch apiErr.StatusCode {
-		case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
-			return true, fmt.Sprintf("BRT: Error in Uploading contacts (Aborted): %v", apiErr.Error())
-		}
-	}
-	return false, fmt.Sprintf("BRT: Error in Uploading contacts: %v", err)
+	return fmt.Sprintf("BRT: Error in Uploading contacts: %v", err)
 }
 
 // Poll reads the state of the import an upload produced and maps it onto the batch router's
@@ -1128,12 +1187,22 @@ func (b *SendGridBulkUploader) pollErrorResponse(err error, importID string) com
 // missing after a restart, and a connector that depended on one would then report failed
 // contacts as delivered.
 //
-// Every path that cannot establish which rows failed returns a non-200 status so the batch
-// router retries, because returning 200 with an empty failed set would mark every job in the
-// import succeeded - the exact silent data loss this method exists to prevent. That includes an
-// errored row whose identifier resolves to no importing job: counting and logging such a row
-// makes a change in the undocumented document shape observable, but it cannot attribute the row,
-// so only the non-200 keeps the affected contact from being delivered by exclusion.
+// A non-200 status is reserved for the cases in which the errors document could not be
+// OBTAINED OR UNDERSTOOD AT ALL: the import parameters cannot be parsed, the document cannot be
+// fetched, or the fetched bytes match none of the shapes the parser accepts. Those are the only
+// situations in which returning 200 would mean reporting an entire import delivered on no
+// evidence, and the batch router retries them.
+//
+// A row that IS understood but whose identifier resolves to no importing job is deliberately
+// NOT one of those cases. It is counted on unmatched_error_row_count and logged - so a change
+// in the undocumented document shape is visible in metrics rather than silent - and
+// reconciliation then proceeds with the rows it could attribute. Failing the whole
+// reconciliation on such a row would be far worse than the exclusion it avoids: the batch
+// router writes NO job status when this method returns a non-200 (handle_async.go), and its
+// poll route has no retry budget to exhaust, so every job would stay importing indefinitely
+// and the destination would stop accepting new work until an operator intervened. A tolerant
+// reconciliation is what the plan prescribes, and it is what the sibling connectors do -
+// Marketo likewise skips a failure row it cannot resolve to a job and still returns 200.
 func (b *SendGridBulkUploader) GetUploadStats(input common.GetUploadStatsInput) common.GetUploadStatsResponse {
 	errorsURLs, response := b.resolveErrorsURLs(input)
 	if len(errorsURLs) == 0 {
@@ -1183,13 +1252,16 @@ func (b *SendGridBulkUploader) GetUploadStats(input common.GetUploadStatsInput) 
 		jobIDs, ok := lookup[strings.ToLower(strings.TrimSpace(row.Identifier))]
 		if !ok || len(jobIDs) == 0 {
 			// Counted and logged so that a change in the undocumented document shape becomes
-			// visible in metrics. The identifier is fingerprinted rather than logged verbatim,
-			// because it is personal data, and the row's own message is sanitized because it can
-			// echo the rejected contact's address back.
+			// visible in metrics rather than silent. The identifier is fingerprinted rather than
+			// logged verbatim, because it is personal data, and the row's own message is
+			// sanitized because it can echo the rejected contact's address back.
 			//
-			// Observability alone would NOT make this safe: an unattributed row's job would be
-			// marked succeeded by exclusion, so the reconciliation is failed closed below
-			// instead, and it is that non-200 - not this log line - that prevents the loss.
+			// The row is then skipped and reconciliation CONTINUES. It has to: this method
+			// cannot invent an attribution, and refusing to reconcile at all would leave every
+			// job in the import stuck importing forever, because the batch router writes no job
+			// status when this method returns a non-200 and its poll route has no retry budget
+			// that could escalate. Skipping costs at most one contact reported as delivered when
+			// SendGrid rejected it; failing closed costs the whole destination.
 			unmatchedRows++
 			b.Logger.Warnn("[sendgrid bulk upload] errored row could not be matched to an importing job",
 				obskit.DestinationID(b.DestinationID),
@@ -1219,24 +1291,18 @@ func (b *SendGridBulkUploader) GetUploadStats(input common.GetUploadStatsInput) 
 	}
 	if unmatchedRows > 0 {
 		b.StatsFactory.NewTaggedStat("unmatched_error_row_count", stats.CountType, b.statLabels(b.DestinationID)).Count(unmatchedRows)
-	}
-	if ambiguousRows > 0 {
-		b.StatsFactory.NewTaggedStat("ambiguous_error_row_count", stats.CountType, b.statLabels(b.DestinationID)).Count(ambiguousRows)
-	}
-	if unmatchedRows > 0 {
-		// FAIL CLOSED. The reconciliation is incomplete, so no job may be marked succeeded from
-		// it: succeeded-by-exclusion would deliver exactly the contacts whose rows could not be
-		// attributed. A retryable status makes the batch router poll again, and abort only once
-		// its retry budget is spent.
-		b.Logger.Errorn("[sendgrid bulk upload] refusing to reconcile an import with unattributable errored rows",
+		// Reported once for the whole document, at error level, so that an unattributable row is
+		// impossible to miss even though it does not stop the reconciliation. The rows that WERE
+		// attributed are still failed below, and the remaining jobs are still resolved by
+		// exclusion, because a reconciliation this method refused to return would strand every
+		// job in the import in the importing state indefinitely.
+		b.Logger.Errorn("[sendgrid bulk upload] reconciling an import with unattributable errored rows",
 			obskit.DestinationID(b.DestinationID),
 			logger.NewIntField("unmatchedRowCount", int64(unmatchedRows)),
 			logger.NewIntField("rowCount", int64(len(rows))))
-		return common.GetUploadStatsResponse{
-			StatusCode: http.StatusInternalServerError,
-			Error: fmt.Sprintf("%d of %d sendgrid errored rows could not be attributed to an importing job",
-				unmatchedRows, len(rows)),
-		}
+	}
+	if ambiguousRows > 0 {
+		b.StatsFactory.NewTaggedStat("ambiguous_error_row_count", stats.CountType, b.statLabels(b.DestinationID)).Count(ambiguousRows)
 	}
 
 	// Succeeded by exclusion: every importing job that no errored row resolved to was
@@ -1589,11 +1655,18 @@ func redactIdentifier(value string) string {
 // bound. Recognizable personal shapes are therefore redacted, control and non-printable
 // characters are dropped, whitespace is collapsed to single spaces, and the result is length
 // capped.
+//
+// A credential is redacted first, on the same reasoning: the API adapter already strips one out
+// of a failing response body, but the errors document is provider-supplied text too, and every
+// piece of text this function is handed ends up in a job status or a log line - the two places a
+// credential must never reach. The exact key is not available here, so only the recognizable
+// shapes are matched; the adapter, which does hold the key, redacts by exact match as well.
 func sanitizeReason(reason string) string {
 	if reason == "" {
 		return ""
 	}
-	redacted := emailPattern.ReplaceAllString(reason, "<redacted-email>")
+	redacted := redactCredentials(reason, "")
+	redacted = emailPattern.ReplaceAllString(redacted, "<redacted-email>")
 	redacted = longNumberPattern.ReplaceAllString(redacted, "<redacted-number>")
 
 	var builder strings.Builder

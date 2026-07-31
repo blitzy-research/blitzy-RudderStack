@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -142,6 +143,47 @@ const (
 	configKeyErrorsURLAllowedHosts  = "errorsURLAllowedHosts"
 	configKeyMaxErrorsDocumentBytes = "maxErrorsDocumentBytes"
 )
+
+// redactedCredential replaces any credential recognized in provider-supplied text.
+const redactedCredential = "<redacted-credential>"
+
+// bearerCredentialPattern and sendGridAPIKeyPattern recognize a credential inside text this
+// connector did not write.
+//
+// This connector never logs its own key. A provider or an intermediary can nonetheless echo the
+// Authorization header back inside its own response body - a debugging proxy is the usual
+// culprit - and that body is quoted into the error this adapter returns, which becomes a job's
+// recorded failure reason and a log field. Belt and braces: the credential is stripped out of
+// such text before it can be kept anywhere.
+//
+// bearerCredentialPattern deliberately stops at the first character that cannot appear in a
+// token, so it never swallows the JSON punctuation around the value it redacts, and the
+// replacement keeps the scheme so the diagnostic ("something sent an Authorization header back")
+// survives. sendGridAPIKeyPattern covers a key echoed WITHOUT the scheme, since SendGrid keys
+// have a recognizable SG.<id>.<secret> shape.
+var (
+	bearerCredentialPattern = regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=\-]+`)
+	sendGridAPIKeyPattern   = regexp.MustCompile(`SG\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}`)
+)
+
+// redactCredentials removes any credential recognizable in provider-supplied text.
+//
+// apiKey is redacted by exact match as well as by pattern, which is what catches a key echoed
+// back bare - under a field name this connector cannot anticipate, for instance - and it is
+// optional so that callers without access to the credential can still apply the patterns. The
+// placeholder contains no quote and no backslash, so a JSON body stays well-formed through the
+// substitution and can still be decoded as an error envelope afterwards.
+func redactCredentials(text, apiKey string) string {
+	if text == "" {
+		return ""
+	}
+	redacted := bearerCredentialPattern.ReplaceAllString(text, "Bearer "+redactedCredential)
+	redacted = sendGridAPIKeyPattern.ReplaceAllString(redacted, redactedCredential)
+	if apiKey != "" {
+		redacted = strings.ReplaceAll(redacted, apiKey, redactedCredential)
+	}
+	return redacted
+}
 
 // getDefaultHTTPClient returns an http.Client with standard configuration
 func getDefaultHTTPClient() *http.Client {
@@ -696,7 +738,15 @@ func (s *sendGridAPIServiceImpl) newRequest(operation, method, endpoint string, 
 // router alone owns the decision to give up, so this connector must never abort because of
 // one. Because detection lives here, nothing else in the package may re-sniff a status code
 // for 429.
+//
+// It is also the single place a failing body is turned into text that gets kept, so it is where
+// any credential a provider or an intermediary echoed back is stripped out - once, for every
+// operation and both error types. The redaction produces a NEW slice and never touches the
+// caller's bytes, so the errors document GetImportErrors returns on success stays byte-identical.
 func (s *sendGridAPIServiceImpl) classifyResponse(operation string, successCode int, resp *http.Response, body []byte) error {
+	if resp.StatusCode != successCode || resp.StatusCode == http.StatusTooManyRequests {
+		body = []byte(redactCredentials(string(body), s.apiKey))
+	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		rateLimitErr := newRateLimitError(resp, body)
 		s.logger.Warnn("[sendgrid bulk upload] rate limited by sendgrid",
