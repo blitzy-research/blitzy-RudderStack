@@ -126,6 +126,7 @@ const (
 	reasonErrorsDocumentMissing   = "the sendgrid import published no errors document, so its rejected contacts cannot be identified"
 	reasonErrorsDocumentFetch     = "the sendgrid import's errors document could not be fetched"
 	reasonErrorsDocumentUnusable  = "the sendgrid import's errors document could not be read in any shape this connector understands"
+	reasonJobUnreconcilable       = "this job's contact could not be rebuilt from its payload, so the import's outcome for it could not be established; the job will be retried"
 )
 
 // Local, per-record rejection causes. Each is permanent: the same event would fail identically on
@@ -1102,7 +1103,9 @@ func unknownImportStatusReason(status string) string {
 // The reconciliation rule is exact. Rows this connector can attribute fail their jobs, retryably.
 // Rows it cannot attribute are counted and reported but change NO other job's outcome - an
 // unattributable row is not evidence that some other contact failed. Every importing job that no row
-// named succeeded, which is what lets one import yield both outcomes at once.
+// named succeeded, which is what lets one import yield both outcomes at once - except for a job no
+// identifier could be derived from, which no row could have named and which is therefore retried
+// rather than counted as delivered.
 func (b *SendGridBulkUploader) GetUploadStats(input common.GetUploadStatsInput) common.GetUploadStatsResponse {
 	statLabels := b.statLabels(b.DestinationID)
 
@@ -1128,7 +1131,18 @@ func (b *SendGridBulkUploader) GetUploadStats(input common.GetUploadStatsInput) 
 		return common.GetUploadStatsResponse{StatusCode: http.StatusInternalServerError, Error: reasonErrorsDocumentUnusable}
 	}
 
-	index := b.buildImportingIndex(input.ImportingList)
+	index, unreconcilable := b.buildImportingIndex(input.ImportingList)
+	if len(unreconcilable) > 0 {
+		// A job whose contact cannot be rebuilt cannot be looked up in the index, so no row can ever
+		// name it. Retrying it is the only honest outcome: leaving it out of the failed set would
+		// hand it to the succeeded-by-exclusion loop below and report a delivery this connector
+		// cannot establish.
+		b.metrics().NewTaggedStat("sendgrid_unreconcilable_importing_job_count", stats.CountType, statLabels).
+			Count(len(unreconcilable))
+		b.log().Warnn("[sendgrid bulk upload] importing jobs could not be indexed for reconciliation",
+			logger.NewIntField("unreconcilableJobCount", int64(len(unreconcilable))),
+			logger.NewIntField("importingJobCount", int64(len(input.ImportingList))))
+	}
 	failedClasses := make(map[int64]string, len(rows))
 	unmatched := 0
 	for _, row := range rows {
@@ -1155,12 +1169,13 @@ func (b *SendGridBulkUploader) GetUploadStats(input common.GetUploadStatsInput) 
 			logger.NewIntField("importingJobCount", int64(len(input.ImportingList))))
 	}
 
+	failedCount := len(failedClasses) + len(unreconcilable)
 	metadata := common.EventStatMeta{
-		FailedKeys:     make([]int64, 0, len(failedClasses)),
+		FailedKeys:     make([]int64, 0, failedCount),
 		AbortedKeys:    make([]int64, 0),
 		WarningKeys:    make([]int64, 0),
 		SucceededKeys:  make([]int64, 0, len(input.ImportingList)),
-		FailedReasons:  make(map[int64]string, len(failedClasses)),
+		FailedReasons:  make(map[int64]string, failedCount),
 		AbortedReasons: make(map[int64]string),
 		WarningReasons: make(map[int64]string),
 	}
@@ -1171,6 +1186,11 @@ func (b *SendGridBulkUploader) GetUploadStats(input common.GetUploadStatsInput) 
 		if class, failed := failedClasses[job.JobID]; failed {
 			metadata.FailedKeys = append(metadata.FailedKeys, job.JobID)
 			metadata.FailedReasons[job.JobID] = rowFailureReason(class)
+			continue
+		}
+		if _, unindexable := unreconcilable[job.JobID]; unindexable {
+			metadata.FailedKeys = append(metadata.FailedKeys, job.JobID)
+			metadata.FailedReasons[job.JobID] = reasonJobUnreconcilable
 			continue
 		}
 		metadata.SucceededKeys = append(metadata.SucceededKeys, job.JobID)
@@ -1212,33 +1232,43 @@ func (b *SendGridBulkUploader) resolveErrorsURL(input common.GetUploadStatsInput
 	return errorsURL, ""
 }
 
-// buildImportingIndex maps every identifier an importing job's contact carries onto that job.
+// buildImportingIndex maps every identifier an importing job's contact carries onto that job, and
+// names separately the jobs no identifier could be derived for.
 //
 // Construction is linear: an identifier's jobIDs are appended without scanning what is already
 // there, so an import in which many jobs share an identifier cannot turn this into quadratic work.
 // An identifier claimed by several jobs fails all of them, because each of them did send the contact
 // SendGrid rejected.
-func (b *SendGridBulkUploader) buildImportingIndex(importingList []*jobsdb.JobT) map[string][]int64 {
+//
+// A job that yields no identifier is returned rather than dropped. It cannot be looked up, so no
+// error row can ever name it, and reporting it succeeded because nothing named it would claim a
+// delivery this connector never established.
+func (b *SendGridBulkUploader) buildImportingIndex(importingList []*jobsdb.JobT) (map[string][]int64, map[int64]struct{}) {
 	index := make(map[string][]int64, len(importingList))
+	unreconcilable := make(map[int64]struct{})
 	for _, job := range importingList {
 		if job == nil {
 			continue
 		}
 		contact, err := b.buildContact(stagedMessage(job.EventPayload))
 		if err != nil {
-			// A contact that cannot be rebuilt cannot be indexed for reconciliation; skip it rather
-			// than inventing an identifier.
+			unreconcilable[job.JobID] = struct{}{}
 			continue
 		}
+		indexed := false
 		for _, identifier := range identifiersOf(contact) {
 			key := reconciliationKey(identifier)
 			if key == "" {
 				continue
 			}
 			index[key] = append(index[key], job.JobID)
+			indexed = true
+		}
+		if !indexed {
+			unreconcilable[job.JobID] = struct{}{}
 		}
 	}
-	return index
+	return index, unreconcilable
 }
 
 func identifiersOf(contact Contact) []string {
@@ -1274,9 +1304,9 @@ func stagedMessage(payload []byte) gjson.Result {
 	return gjson.ParseBytes(payload)
 }
 
-// parseImportErrorRows accepts a bare array, errors/results wrapper, or NDJSON because the provider
-// does not publish the document schema. The adapter already bounds total bytes; this function also
-// bounds the number of row structs it materializes.
+// parseImportErrorRows accepts a bare array, an errors/results wrapper, a lone row object, or NDJSON
+// because the provider does not publish the document schema. The adapter already bounds total bytes;
+// this function also bounds how many entries it is willing to examine.
 func parseImportErrorRows(document []byte) ([]ImportErrorRow, error) {
 	trimmed := bytes.TrimSpace(document)
 	if len(trimmed) == 0 {
@@ -1299,19 +1329,32 @@ func parseImportErrorRows(document []byte) ([]ImportErrorRow, error) {
 				return rowsOf(wrapped)
 			}
 		}
+		// An import that rejected a single contact can publish that one row on its own, which is
+		// valid JSON as a whole document and therefore never reaches the NDJSON branch. Reading it
+		// as a one-row document is what keeps such an import reconcilable: the alternative reports
+		// the document unusable, and this route has no retry budget to escalate, so the import would
+		// be polled and rejected for as long as it exists.
+		if row, usable := importErrorRowFrom(parsed); usable {
+			return []ImportErrorRow{row}, nil
+		}
 		return nil, errUnusableErrorsDocument
 	default:
 		return nil, errUnusableErrorsDocument
 	}
 }
 
+// rowsOf reads the rows of one array. The row budget is charged per entry SCANNED rather than per row
+// materialized, so a document made almost entirely of entries this connector cannot use costs the
+// same bounded work as one made of usable rows.
 func rowsOf(array gjson.Result) ([]ImportErrorRow, error) {
 	rows := make([]ImportErrorRow, 0, 8)
+	scanned := 0
 	array.ForEach(func(_, entry gjson.Result) bool {
+		scanned++
 		if row, usable := importErrorRowFrom(entry); usable {
 			rows = append(rows, row)
 		}
-		return len(rows) < maxErrorRowsPerDocument
+		return scanned < maxErrorRowsPerDocument
 	})
 	if len(rows) == 0 {
 		return nil, errUnusableErrorsDocument
@@ -1319,10 +1362,13 @@ func rowsOf(array gjson.Result) ([]ImportErrorRow, error) {
 	return rows, nil
 }
 
+// newlineDelimitedRows reads one row per line, charging the same per-scanned-entry budget: every
+// non-blank line counts, whether or not it yields a usable row.
 func newlineDelimitedRows(document []byte) ([]ImportErrorRow, error) {
 	rows := make([]ImportErrorRow, 0, 8)
 	scanner := bufio.NewScanner(bytes.NewReader(document))
 	scanner.Buffer(nil, maxStagingLineBytes)
+	scanned := 0
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
@@ -1331,10 +1377,11 @@ func newlineDelimitedRows(document []byte) ([]ImportErrorRow, error) {
 		if !gjson.ValidBytes(line) {
 			return nil, errUnusableErrorsDocument
 		}
+		scanned++
 		if row, usable := importErrorRowFrom(gjson.ParseBytes(line)); usable {
 			rows = append(rows, row)
 		}
-		if len(rows) >= maxErrorRowsPerDocument {
+		if scanned >= maxErrorRowsPerDocument {
 			break
 		}
 	}
@@ -1371,32 +1418,48 @@ func boundedString(value gjson.Result, maxRunes int) string {
 	return string([]rune(text)[:maxRunes])
 }
 
-// classifyRowMessage reduces a provider row message to one of this connector's error classes.
+// errorClassKeywords is the precedence this connector classifies a row message by, most specific
+// first. The order is part of the contract rather than an accident of where a case was written,
+// because a provider message frequently names more than one thing: "invalid email address for list
+// 123" mentions both an email and a list, and it describes the email.
+//
+// Specificity is what orders the table. A multi-word phrase ("custom field") can only be about that
+// subject. An authorization or duplication verdict describes the whole operation and is unambiguous
+// whichever field it names. A field word ("phone", "email") identifies the rejected value. And
+// "list" ranks last because it is the weakest signal of the set: it is a short, common word that
+// appears in prose about failures of every other kind.
+var errorClassKeywords = []struct {
+	class    string
+	keywords []string
+}{
+	{errorClassCustomFieldRejected, []string{"custom field", "custom_field"}},
+	{errorClassNotPermitted, []string{"permission", "not authorized", "unauthorized", "forbidden"}},
+	{errorClassDuplicateContact, []string{"duplicate", "already exists"}},
+	{errorClassInvalidPhoneNumber, []string{"phone"}},
+	{errorClassInvalidEmail, []string{"email"}},
+	{errorClassListRejected, []string{"list"}},
+}
+
+// classifyRowMessage reduces a provider row message to one of this connector's error classes,
+// scanning errorClassKeywords in order so a message matching several classes always resolves to the
+// most specific one.
 //
 // This is the ONLY use ever made of that message: the class is what a job's failure reason carries,
 // so free-form provider prose - which may restate a name, an address or any custom value - never
 // reaches durable storage. An unrecognized message is reported as unspecified rather than repeated.
 func classifyRowMessage(message string) string {
 	lowered := strings.ToLower(message)
-	switch {
-	case lowered == "":
-		return errorClassUnspecified
-	case strings.Contains(lowered, "custom field"), strings.Contains(lowered, "custom_field"):
-		return errorClassCustomFieldRejected
-	case strings.Contains(lowered, "phone"):
-		return errorClassInvalidPhoneNumber
-	case strings.Contains(lowered, "list"):
-		return errorClassListRejected
-	case strings.Contains(lowered, "duplicate"), strings.Contains(lowered, "already exists"):
-		return errorClassDuplicateContact
-	case strings.Contains(lowered, "permission"), strings.Contains(lowered, "not authorized"),
-		strings.Contains(lowered, "unauthorized"), strings.Contains(lowered, "forbidden"):
-		return errorClassNotPermitted
-	case strings.Contains(lowered, "email"):
-		return errorClassInvalidEmail
-	default:
+	if lowered == "" {
 		return errorClassUnspecified
 	}
+	for _, candidate := range errorClassKeywords {
+		for _, keyword := range candidate.keywords {
+			if strings.Contains(lowered, keyword) {
+				return candidate.class
+			}
+		}
+	}
+	return errorClassUnspecified
 }
 
 // rowFailureReason is the per-job reason a reconciled failure carries. It is retryable by design: the

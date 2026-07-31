@@ -310,11 +310,8 @@ func (s *sendGridAPIServiceImpl) UploadContacts(request UpsertRequest) (*UpsertR
 	defer func() { _ = resp.Body.Close() }()
 	s.statsFactory.NewTaggedStat("sendgrid_upload_time", stats.TimerType, s.statLabels).Since(startTime)
 
-	body, err := readLimitedBody(resp.Body, maxAPIResponseBytes)
+	body, err := readClassifiedBody(operationUploadContacts, http.StatusAccepted, resp, maxAPIResponseBytes)
 	if err != nil {
-		return nil, err
-	}
-	if err := classifyResponse(operationUploadContacts, http.StatusAccepted, resp, body); err != nil {
 		return nil, err
 	}
 	var upsert UpsertResponse
@@ -356,11 +353,8 @@ func (s *sendGridAPIServiceImpl) GetImportStatus(jobID string) (*ImportStatusRes
 	defer func() { _ = resp.Body.Close() }()
 	s.statsFactory.NewTaggedStat("sendgrid_poll_time", stats.TimerType, s.statLabels).Since(startTime)
 
-	body, err := readLimitedBody(resp.Body, maxAPIResponseBytes)
+	body, err := readClassifiedBody(operationGetImportStatus, http.StatusOK, resp, maxAPIResponseBytes)
 	if err != nil {
-		return nil, err
-	}
-	if err := classifyResponse(operationGetImportStatus, http.StatusOK, resp, body); err != nil {
 		return nil, err
 	}
 	var status ImportStatusResponse
@@ -401,11 +395,8 @@ func (s *sendGridAPIServiceImpl) GetImportErrors(errorsURL string) ([]byte, erro
 	defer func() { _ = resp.Body.Close() }()
 	s.statsFactory.NewTaggedStat("sendgrid_errors_document_time", stats.TimerType, s.statLabels).Since(startTime)
 
-	body, err := readLimitedBody(resp.Body, maxErrorsDocumentBytes)
+	body, err := readClassifiedBody(operationGetImportErrors, http.StatusOK, resp, maxErrorsDocumentBytes)
 	if err != nil {
-		return nil, err
-	}
-	if err := classifyResponse(operationGetImportErrors, http.StatusOK, resp, body); err != nil {
 		return nil, err
 	}
 	s.statsFactory.NewTaggedStat("sendgrid_errors_document_size", stats.HistogramType, s.statLabels).
@@ -451,6 +442,24 @@ func isSendGridHost(host string) bool {
 		}
 	}
 	return false
+}
+
+// readClassifiedBody reads a bounded response body and interprets the status.
+//
+// The status is classified BEFORE a read failure is reported, and that ordering is the point: a
+// rate-limited response carries its window in the HEADERS, so it must still surface as the typed
+// RateLimitError - keeping its jobs on the retryable channel with a usable reset window - even when
+// the body that came with it is unreadable or over the limit. Only a response this connector would
+// otherwise have used reports the read failure.
+func readClassifiedBody(operation string, successCode int, resp *http.Response, limit int64) ([]byte, error) {
+	body, readErr := readLimitedBody(resp.Body, limit)
+	if err := classifyResponse(operation, successCode, resp, body); err != nil {
+		return nil, err
+	}
+	if readErr != nil {
+		return nil, readErr
+	}
+	return body, nil
 }
 
 // readLimitedBody reads at most limit bytes and treats anything longer as a failure rather than

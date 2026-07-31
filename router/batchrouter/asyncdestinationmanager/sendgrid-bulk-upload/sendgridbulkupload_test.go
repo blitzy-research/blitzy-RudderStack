@@ -91,7 +91,7 @@ func stagedMessages(t *testing.T) map[int64]string {
 	contents, err := os.ReadFile(stagingFixturePath)
 	require.NoError(t, err)
 	messages := make(map[int64]string)
-	for _, line := range strings.Split(strings.TrimSpace(string(contents)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(contents)), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
@@ -256,6 +256,96 @@ func TestNewManager(t *testing.T) {
 	})
 }
 
+// TestAPIServiceRejectsUnusableInput covers the HTTP adapter's input guards, which decide before any
+// request is built and are therefore reachable through the exported constructor without a network, a
+// server or a mock. The controls that need a socket - the dial and redirect guards - are deliberately
+// left out: this suite's worth rests on it never opening one.
+func TestAPIServiceRejectsUnusableInput(t *testing.T) {
+	t.Parallel()
+
+	newService := func(t *testing.T) sendgridbulkupload.SendGridAPIService {
+		t.Helper()
+		service, err := sendgridbulkupload.NewSendGridAPIService(testDestinationID,
+			sendgridbulkupload.DestinationConfig{APIKey: testAPIKey}, stats.NOP)
+		require.NoError(t, err)
+		require.NotNil(t, service)
+		return service
+	}
+
+	t.Run("construction fails without an api key", func(t *testing.T) {
+		t.Parallel()
+		service, err := sendgridbulkupload.NewSendGridAPIService(testDestinationID,
+			sendgridbulkupload.DestinationConfig{APIKey: "   "}, stats.NOP)
+		require.Error(t, err)
+		require.Nil(t, service)
+		require.Contains(t, err.Error(), "apiKey is missing")
+	})
+
+	t.Run("an upsert carrying no contacts is refused", func(t *testing.T) {
+		t.Parallel()
+		upsert, err := newService(t).UploadContacts(sendgridbulkupload.UpsertRequest{ListIDs: []string{testConfigListID}})
+		require.Error(t, err)
+		require.Nil(t, upsert)
+		require.Contains(t, err.Error(), "carrying no contacts")
+		require.NotContains(t, err.Error(), testAPIKey)
+	})
+
+	t.Run("import job ids the path will not carry are refused", func(t *testing.T) {
+		t.Parallel()
+		for name, jobID := range map[string]string{
+			"a blank job id":      "   ",
+			"an over-long job id": strings.Repeat("j", 257),
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				status, err := newService(t).GetImportStatus(jobID)
+				require.Error(t, err)
+				require.Nil(t, status)
+				require.NotContains(t, err.Error(), testAPIKey)
+			})
+		}
+	})
+
+	// Every rejection reports a stable token and never the URL, which may be pre-signed and therefore
+	// carry a credential in its query string.
+	t.Run("errors document urls this connector will not fetch", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name   string
+			url    string
+			reason string
+		}{
+			{name: "a blank url", url: "  ", reason: "blank_url"},
+			{
+				name:   "a url longer than the connector accepts",
+				url:    "https://errors.example.com/doc?signature=" + strings.Repeat("a", 2048),
+				reason: "url_too_long",
+			},
+			{name: "a url that cannot be parsed", url: "https://errors.example.com/doc%zz", reason: "unparseable_url"},
+			{name: "a plaintext url", url: "http://errors.example.com/doc", reason: "unsupported_scheme"},
+			{
+				name:   "a url embedding credentials",
+				url:    "https://svc:s3cret@errors.example.com/doc",
+				reason: "credentials_in_url",
+			},
+			{name: "a url with no host", url: "https:///doc", reason: "blank_host"},
+			{name: "a url on another port", url: "https://errors.example.com:8443/doc", reason: "unsupported_port"},
+		}
+		for _, testCase := range cases {
+			t.Run(testCase.name, func(t *testing.T) {
+				t.Parallel()
+				document, err := newService(t).GetImportErrors(testCase.url)
+				require.Error(t, err)
+				require.Nil(t, document)
+				require.Contains(t, err.Error(), "reason: "+testCase.reason)
+				require.NotContains(t, err.Error(), "errors.example.com", "a rejection must not echo the url")
+				require.NotContains(t, err.Error(), "s3cret")
+				require.NotContains(t, err.Error(), testAPIKey)
+			})
+		}
+	})
+}
+
 func TestTransform(t *testing.T) {
 	t.Parallel()
 
@@ -385,8 +475,7 @@ func TestUploadRateLimited(t *testing.T) {
 			Remaining:  0,
 		})
 
-	uploader := newUploader(t, newAPIServiceMock(t), testEventListID)
-	uploader.SendGridAPIService = apiService
+	uploader := newUploader(t, apiService, testEventListID)
 	output := uploader.Upload(asyncDestination(stagingFixturePath, stagedJobIDs()))
 
 	require.ElementsMatch(t, stagedJobIDs(), output.FailedJobIDs)
@@ -941,6 +1030,183 @@ func TestGetUploadStatsDocumentShapes(t *testing.T) {
 			require.Len(t, response.Metadata.FailedReasons, 2)
 		})
 	}
+
+	// An import that rejected a single contact can publish that one row on its own. It is valid JSON
+	// as a whole document, so it never reaches the newline-delimited branch and has to be read as a
+	// one-row document: reporting it unusable would hold the import in "importing" for as long as it
+	// exists, because this route has no retry budget to escalate.
+	t.Run("a lone row object published on its own", func(t *testing.T) {
+		t.Parallel()
+		apiService := newAPIServiceMock(t)
+		apiService.EXPECT().GetImportErrors(testErrorsURL).Times(1).
+			Return([]byte(`{"contact":{"email":"blake@example.com"},"error_message":"invalid email"}`), nil)
+
+		uploader := newUploader(t, apiService, testEventListID)
+		response := uploader.GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: testErrorsURL,
+			Parameters:          importingParameters(t),
+			ImportingList:       importingJobs(t, stagedJobIDs()...),
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.Equal(t, []int64{2}, response.Metadata.FailedKeys)
+		require.Equal(t, []int64{1, 3, 4, 5}, response.Metadata.SucceededKeys)
+		require.Contains(t, response.Metadata.FailedReasons[2], "error class: invalid_email")
+		require.Empty(t, response.Metadata.AbortedKeys)
+		requireCarriesNoContactData(t, response.Metadata.FailedReasons[2])
+	})
+}
+
+// errorRowsBudget mirrors the connector's per-document row budget, which is twice the 30,000 contacts
+// one request can carry. The budget is charged per entry SCANNED, so a document made of entries the
+// connector cannot use costs the same bounded work as one made of usable rows.
+const errorRowsBudget = 2 * 30_000
+
+// TestGetUploadStatsBoundsTheErrorsDocumentRowBudget proves the row budget bounds how much of a
+// document is examined, not merely how many rows are kept. A row beyond the budget is not reached, and
+// the import is retried rather than reported delivered.
+func TestGetUploadStatsBoundsTheErrorsDocumentRowBudget(t *testing.T) {
+	t.Parallel()
+
+	arrayDocument := func(unusableEntries int) string {
+		var document strings.Builder
+		document.WriteByte('[')
+		for range unusableEntries {
+			// A number is a well-formed entry that can never be a row, which is exactly the shape
+			// that used to be scanned without ever consuming the budget.
+			document.WriteString("0,")
+		}
+		document.WriteString(`{"email":"blake@example.com","message":"invalid email"}]`)
+		return document.String()
+	}
+	newlineDocument := func(unusableLines int) string {
+		var document strings.Builder
+		for range unusableLines {
+			document.WriteString("{\"unexpected\":\"shape\"}\n")
+		}
+		document.WriteString("{\"email\":\"blake@example.com\",\"message\":\"invalid email\"}\n")
+		return document.String()
+	}
+
+	cases := []struct {
+		name     string
+		document string
+		reached  bool
+	}{
+		{name: "an array row within the budget is reconciled", document: arrayDocument(8), reached: true},
+		{name: "an array row beyond the budget is not reached", document: arrayDocument(errorRowsBudget), reached: false},
+		{name: "a newline delimited row within the budget is reconciled", document: newlineDocument(8), reached: true},
+		{name: "a newline delimited row beyond the budget is not reached", document: newlineDocument(errorRowsBudget), reached: false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			apiService := newAPIServiceMock(t)
+			apiService.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return([]byte(testCase.document), nil)
+
+			uploader := newUploader(t, apiService, testEventListID)
+			response := uploader.GetUploadStats(common.GetUploadStatsInput{
+				FailedJobParameters: testErrorsURL,
+				Parameters:          importingParameters(t),
+				ImportingList:       importingJobs(t, stagedJobIDs()...),
+			})
+
+			if testCase.reached {
+				require.Equal(t, http.StatusOK, response.StatusCode)
+				require.Equal(t, []int64{2}, response.Metadata.FailedKeys)
+				require.Equal(t, []int64{1, 3, 4, 5}, response.Metadata.SucceededKeys)
+				return
+			}
+			// Nothing was read out of the document, so no job may be reported either way: 500 has the
+			// framework retry instead of marking the whole import succeeded.
+			require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+			require.Contains(t, response.Error, "could not be read in any shape")
+			require.Empty(t, response.Metadata.FailedKeys)
+			require.Empty(t, response.Metadata.SucceededKeys)
+		})
+	}
+}
+
+// TestReconciledReasonClassPrecedence pins the order provider messages are classified in. A message
+// frequently names more than one thing, so the precedence is part of the contract rather than an
+// accident of ordering: the most specific match wins, and the class is all a persisted reason carries.
+func TestReconciledReasonClassPrecedence(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		message  string
+		expected string
+	}{
+		{
+			name:     "a message naming an email and a list describes the email",
+			message:  "Invalid email address provided for list 4207",
+			expected: "invalid_email",
+		},
+		{
+			name:     "a custom field verdict outranks every other keyword",
+			message:  "custom field w1 rejected for this email address on list 4207",
+			expected: "custom_field_rejected",
+		},
+		{
+			name:     "an authorization verdict outranks a field word",
+			message:  "not authorized to add this email address to the list",
+			expected: "not_permitted",
+		},
+		{
+			name:     "a duplication verdict outranks a field word",
+			message:  "duplicate email address for this list",
+			expected: "duplicate_contact",
+		},
+		{
+			name:     "a phone verdict outranks an email mention",
+			message:  "phone number is not valid, and no email address was supplied",
+			expected: "invalid_phone_number",
+		},
+		{
+			name:     "a list is still recognized on its own",
+			message:  "list membership rejected",
+			expected: "list_rejected",
+		},
+		{
+			name:     "prose matching no keyword is unspecified",
+			message:  "the contact could not be stored",
+			expected: "unspecified",
+		},
+		{
+			name:     "a row carrying no message at all is unspecified",
+			message:  "",
+			expected: "unspecified",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			document, err := jsonrs.Marshal([]map[string]string{
+				{"email": stagedEmails[2], "message": testCase.message},
+			})
+			require.NoError(t, err)
+
+			apiService := newAPIServiceMock(t)
+			apiService.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return(document, nil)
+
+			uploader := newUploader(t, apiService, testEventListID)
+			response := uploader.GetUploadStats(common.GetUploadStatsInput{
+				FailedJobParameters: testErrorsURL,
+				Parameters:          importingParameters(t),
+				ImportingList:       importingJobs(t, stagedJobIDs()...),
+			})
+
+			require.Equal(t, http.StatusOK, response.StatusCode)
+			require.Equal(t, []int64{2}, response.Metadata.FailedKeys)
+			reason := response.Metadata.FailedReasons[2]
+			require.Contains(t, reason, "error class: "+testCase.expected)
+			if testCase.message != "" {
+				require.NotContains(t, reason, testCase.message, "provider prose must never reach a persisted reason")
+			}
+			requireCarriesNoContactData(t, reason)
+		})
+	}
 }
 
 func TestGetUploadStatsReconciliation(t *testing.T) {
@@ -1052,6 +1318,34 @@ func TestGetUploadStatsReconciliation(t *testing.T) {
 		require.NotContains(t, reason, "Erin Okafor")
 		require.NotContains(t, reason, "500 Harbor Blvd")
 		requireCarriesNoContactData(t, reason)
+	})
+
+	t.Run("an importing job whose contact cannot be rebuilt is retried rather than reported delivered", func(t *testing.T) {
+		t.Parallel()
+		apiService := newAPIServiceMock(t)
+		apiService.EXPECT().GetImportErrors(testErrorsURL).Times(1).
+			Return([]byte(`[{"email":"blake@example.com","message":"invalid email"}]`), nil)
+
+		// This job carries none of the identifiers SendGrid accepts, so no error row could ever name
+		// it and the document says nothing about it either way. Succeeding it by exclusion would claim
+		// a delivery that was never established.
+		importingList := append(importingJobs(t, 1, 2),
+			importingJob(9, `{"type":"track","event":"Signed Up","properties":{"plan":"pro"}}`))
+
+		uploader := newUploader(t, apiService, testEventListID)
+		response := uploader.GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: testErrorsURL,
+			Parameters:          importingParameters(t),
+			ImportingList:       importingList,
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.Equal(t, []int64{2, 9}, response.Metadata.FailedKeys)
+		require.Equal(t, []int64{1}, response.Metadata.SucceededKeys)
+		require.Contains(t, response.Metadata.FailedReasons[9], "could not be rebuilt from its payload")
+		// Retryable, never terminal: the framework decides when to give up.
+		require.Empty(t, response.Metadata.AbortedKeys)
+		requireCarriesNoContactData(t, response.Metadata.FailedReasons[9])
 	})
 
 	t.Run("the errors document url is re-read from the import when the poll response carried none", func(t *testing.T) {
