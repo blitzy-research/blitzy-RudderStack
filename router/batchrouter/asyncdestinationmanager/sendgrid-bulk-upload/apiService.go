@@ -151,39 +151,51 @@ const (
 // URL. Exactly one does not: the per-import errors document, whose address arrives inside a
 // SendGrid response as results.errors_url. That address is remote input, and fetching remote
 // input from a URL chosen by someone else is server-side request forgery unless it is
-// constrained. It is constrained, and every constraint except one is applied unconditionally.
-// The one exception is an optional host allow list, which is the only control an operator can
-// influence.
+// constrained. Every constraint below is applied unconditionally, including the host allow list;
+// the allow list is the only one an operator can influence.
 //
-// THE DEFAULT. errorsURLAllowedHosts is EMPTY by default, which means no host narrowing is
-// applied. SendGrid does not commit to serving the errors document from its own domains: the
-// import status response carries an opaque URL that may legitimately point at object storage on
-// an entirely different public host. Defaulting the list to SendGrid's own domains would
-// therefore reject a perfectly legitimate document, and that is not a harmless conservatism -
-// GetUploadStats would answer non-200, the batch router would write NO job status at all, and
-// the destination would stay blocked behind an import that can never be resolved. Requiring an
-// operator to first discover and configure the provider's storage host is not an acceptable
-// default either.
+// THE DEFAULT IS DENY. errorsURLAllowedHosts defaults to SendGrid's own domains, and it is
+// enforced unconditionally: a host that is not on the effective list is refused before any
+// connection is attempted. A provider-supplied address is remote input, so the set of hosts this
+// process may be directed at has to be enumerated rather than inferred from the rest of the
+// request's shape. Every other control here narrows WHAT may be reached at a host; only this one
+// narrows WHICH hosts exist at all, and without it any publicly routable HTTPS host on port 443
+// - a partner's API, a third-party collector, an attacker-controlled endpoint - is reachable on
+// the strength of one field in a provider response. That is server-side request forgery, and no
+// amount of transport hardening substitutes for enumerating the destination.
 //
-// WHAT ACTUALLY BOUNDS THIS REQUEST. The host is not the boundary. validateErrorsURL and
-// newErrorsDocumentHTTPClient apply, unconditionally and without needing to know the provider's
-// hosting arrangements: HTTPS only, no opaque reference, no embedded credentials, no fragment, a
-// domain name rather than an IP literal, no punycode host, port 443 only, a length-bounded URL,
-// a dial-time refusal of any address that is not publicly routable (which also defeats DNS
-// rebinding onto an internal address), a capped redirect chain whose every hop is re-validated
-// against those same rules, the Authorization header stripped from every redirected request, and
-// a bounded response read.
+// THE COST OF THE DEFAULT, STATED PLAINLY. SendGrid does not commit to serving the errors
+// document from its own domains, so an import whose document is published on object storage on
+// another host WILL be refused until an operator adds that host. The refusal is loud, names both
+// the offending host and the configuration key that governs it, is counted in a metric, and is
+// retryable rather than terminal (see WHAT A REJECTION THEN DOES below), so such an import
+// stalls visibly and resumes the moment the host is allowed. NO JOB IS EVER MARKED DELIVERED,
+// and none is aborted, on the strength of a document that was refused. A stalled,
+// self-describing, operator-resolvable import is the acceptable failure mode here; an
+// unconstrained outbound fetch to an address chosen elsewhere is not.
+//
+// WHAT ELSE BOUNDS THIS REQUEST. On top of the allow list, validateErrorsURL and
+// newErrorsDocumentHTTPClient apply, unconditionally: HTTPS only, no opaque reference, no
+// embedded credentials, no fragment, a domain name rather than an IP literal, no punycode host,
+// port 443 only, a length-bounded URL, a dial-time refusal of any address that is not publicly
+// routable (which also defeats DNS rebinding onto an internal address), a capped redirect chain
+// whose every hop is re-validated against those same rules AND must stay on an allowed host, the
+// Authorization and Referer headers deleted from every redirected request, and a bounded
+// response read.
 //
 // THE CREDENTIAL IS NARROWED SEPARATELY, AND IS NOT OPERATOR CONFIGURABLE. The API key is
 // attached only for the hosts in sendGridHostSuffixes. A URL published by the provider therefore
 // can never carry this destination's API key to a third-party host, whatever the allow list says
 // and whether or not one is configured.
 //
-// HOW AN OPERATOR NARROWS IT. Setting BatchRouter.SENDGRID_BULK_UPLOAD.errorsURLAllowedHosts, or
-// BatchRouter.errorsURLAllowedHosts to cover every batch destination, restricts the document host
-// to those entries. Host matching is exact-or-dot-suffix (see hostAllowed), so a bare
+// HOW AN OPERATOR WIDENS IT. Setting BatchRouter.SENDGRID_BULK_UPLOAD.errorsURLAllowedHosts, or
+// BatchRouter.errorsURLAllowedHosts to cover every batch destination, REPLACES the default list
+// with those entries, so an override meant to add a storage host must also restate the SendGrid
+// domains it still needs. Host matching is exact-or-dot-suffix (see hostAllowed), so a bare
 // object-storage suffix such as "s3.amazonaws.com" would admit EVERY bucket on that provider;
-// prefer the specific host. A wildcard is never accepted.
+// name the specific host instead. A wildcard is never accepted, and an override that normalizes
+// away to nothing at all falls back to the default list rather than to no list, so a blank or
+// all-blank value can never reopen a default-deny policy by accident.
 //
 // WHAT A REJECTION THEN DOES. It happens BEFORE ANY CONNECTION IS ATTEMPTED, it is retryable
 // rather than terminal, and it is deliberately loud:
@@ -209,31 +221,33 @@ const (
 // carry this destination's API key anywhere else. Deliberately NOT operator configurable.
 var sendGridHostSuffixes = []string{"sendgrid.com", "sendgrid.net"}
 
-// defaultErrorsURLAllowedHosts is the default host allow list applied to the errors document
-// URL, and it is deliberately EMPTY, which means "no host allow list is enforced".
+// defaultErrorsURLAllowedHosts is the host allow list applied to the errors document URL when an
+// operator has configured none, and it is deliberately NONEMPTY: this connector is DEFAULT-DENY
+// about the one address it takes from remote input.
 //
-// The errors document URL is published by SendGrid itself, and SendGrid does not commit to
-// serving it from its own domains: the import status response carries an opaque URL that may
-// point at object storage on an entirely different public host. An allow list defaulting to
-// SendGrid's own domains would therefore reject a perfectly legitimate document, which is not a
-// harmless conservatism - GetUploadStats would answer non-200, the batch router would write NO
-// job status at all, and the destination would stay blocked behind an import that can never be
-// resolved. Requiring an operator to discover and configure the provider's storage host before
-// a partially errored import can complete is not an acceptable default either.
+// The errors document URL arrives inside a SendGrid response, so it decides, at runtime, which
+// host this process connects to. Enumerating the acceptable hosts is the only control that bounds
+// WHICH hosts exist at all; everything else in validateErrorsURL bounds what may be reached at a
+// host that is already accepted. Shipping this empty would mean any publicly routable HTTPS host
+// on port 443 is reachable on the strength of one provider-supplied field, which is server-side
+// request forgery however well the rest of the request is constrained.
 //
-// The host is therefore not the boundary. What actually bounds this request is applied
-// unconditionally in validateErrorsURL and newErrorsDocumentHTTPClient and does not depend on
-// knowing the provider's hosting arrangements: HTTPS only, no embedded credentials, no fragment,
-// a domain name rather than an IP literal, port 443 only, a dial-time refusal of any address
-// that is not publicly routable (which also defeats DNS rebinding onto an internal address), a
-// capped redirect chain whose every hop is re-validated against those same rules, the credential
-// stripped from every redirected request, and a bounded response read.
+// The known cost is accepted deliberately. SendGrid does not commit to serving the document from
+// its own domains, so a document published on object storage on another host is refused until an
+// operator names that host in BatchRouter.SENDGRID_BULK_UPLOAD.errorsURLAllowedHosts (or in
+// BatchRouter.errorsURLAllowedHosts for every batch destination). That refusal happens before any
+// connection, names both the host and the key, increments
+// errors_document_url_rejected_count{reason:"hostNotAllowed"}, and is retryable: GetUploadStats
+// answers 500, the batch router writes no job status, and every job of that import is polled
+// again. The import therefore stalls visibly and resumes as soon as the host is allowed, and no
+// job is ever marked delivered or aborted because a document could not be read. A visible,
+// self-describing stall is the correct trade against an unconstrained outbound fetch.
 //
-// An operator who does want to pin the host can still do so through
-// BatchRouter.SENDGRID_BULK_UPLOAD.errorsURLAllowedHosts, and the rejection error then names
-// that key so the required action is self-evident. Configuring it does NOT widen the credential:
-// the bearer key is attached only for the SendGrid domains above, whatever the allow list says.
-var defaultErrorsURLAllowedHosts []string
+// An override REPLACES this list rather than extending it, so an operator adding a storage host
+// must restate the SendGrid domains they still need. Widening the list does NOT widen the
+// credential: the bearer key is attached only for sendGridHostSuffixes above, whatever the allow
+// list says. See THE ERRORS-DOCUMENT HOST CONTRACT above for the complete statement.
+var defaultErrorsURLAllowedHosts = []string{"sendgrid.com", "sendgrid.net"}
 
 // configKeyErrorsURLAllowedHosts and configKeyMaxErrorsDocumentBytes resolve
 // BatchRouter.SENDGRID_BULK_UPLOAD.<key> and fall back to BatchRouter.<key>.
@@ -250,15 +264,20 @@ const (
 // entry in an allow list is not a permissive entry - hostAllowed already refuses to match one -
 // but leaving it in would make the effective list disagree with the configured one.
 //
-// An override that normalizes away to nothing at all resolves to NO allow list, which is also
-// the shipped default: no host narrowing is applied and the request is bounded by the transport
-// controls instead. That is the safe reading of such a value, because the alternative - treating
-// it as a list no host can satisfy - would refuse every errors document, including the ones
-// SendGrid serves itself, so a configuration mistake such as an empty string or a list of blanks
-// would stall reconciliation for every import on a destination that was working a moment
-// earlier. See the errors-document host contract above for why the host is not the boundary.
+// An override that normalizes away to nothing at all - an empty string, a list of blanks, a list
+// of bare dots - falls back to defaultErrorsURLAllowedHosts. It must NOT resolve to "no allow
+// list": this connector is default-deny about the errors document host, and reading an emptied
+// override as "allow every host" would let a configuration mistake silently reopen the very hole
+// the default closes. Falling back to the default keeps the SendGrid domains working, so the
+// mistake costs at most the operator's own additional hosts, and that loss is loud - the
+// rejection names the host and this configuration key. Refusing every host instead was rejected
+// as the worse failure: it would stall reconciliation for imports SendGrid serves itself.
 func resolveErrorsURLAllowedHosts() []string {
-	return normalizeAllowedHosts(common.GetBatchRouterConfigStringMap(configKeyErrorsURLAllowedHosts, destName, defaultErrorsURLAllowedHosts))
+	configured := normalizeAllowedHosts(common.GetBatchRouterConfigStringMap(configKeyErrorsURLAllowedHosts, destName, defaultErrorsURLAllowedHosts))
+	if len(configured) == 0 {
+		return normalizeAllowedHosts(defaultErrorsURLAllowedHosts)
+	}
+	return configured
 }
 
 // resolveMaxErrorsDocumentBytes reads the errors-document read budget and validates it before
@@ -544,7 +563,19 @@ func parseRetryAfterHeader(raw string) string {
 	return ""
 }
 
-// getDefaultHTTPClient returns an http.Client with standard configuration
+// getDefaultHTTPClient returns the client used for the two requests whose target is a
+// compile-time constant on api.sendgrid.com: the contacts upsert and the import status read.
+//
+// It REFUSES EVERY REDIRECT. Both endpoints are fixed, documented and non-redirecting, so a 3xx
+// from either is an anomaly rather than routing, and following one would hand two capabilities to
+// whatever produced it. Go attaches this destination's bearer credential to a redirected request
+// whenever the target host matches or is a subdomain of the original, so a redirect towards any
+// *.sendgrid.com name - including one that is not api.sendgrid.com - would forward the API key.
+// And because the upsert is a PUT, a 307 or 308 replays the whole contact payload, personal data
+// included, at the new location. Refusing the redirect closes both: Client.Do fails with a
+// wrapped *url.Error, the response body is closed for us, and the caller's existing transport
+// error path turns it into a retryable failure. Nothing legitimate is given up, because neither
+// endpoint redirects.
 func getDefaultHTTPClient() *http.Client {
 	transport := &http.Transport{
 		MaxIdleConns:        defaultMaxConnsPerHost,
@@ -564,6 +595,15 @@ func getDefaultHTTPClient() *http.Client {
 	return &http.Client{
 		Transport: transport,
 		Timeout:   defaultTimeout,
+		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+			// Belt and braces: the credential and any Referer are dropped before the error is
+			// returned, so a future change that starts following redirects here cannot leak
+			// them by omission.
+			req.Header.Del("Authorization")
+			req.Header.Del("Referer")
+			return fmt.Errorf("the sendgrid api redirected to %s, which this connector does not follow",
+				redactedURLReference(req.URL.String()))
+		},
 	}
 }
 
@@ -576,18 +616,26 @@ func getDefaultHTTPClient() *http.Client {
 //     which also defeats a DNS answer that resolves a permitted host to an internal address;
 //   - the redirect chain is capped and every hop is re-validated against the same policy the
 //     original URL had to satisfy - HTTPS, no embedded credentials, no fragment, a domain name
-//     rather than an IP literal, port 443, and the operator's optional host allow list;
-//   - the Authorization header is removed from every redirected request, whatever its target,
-//     which is strictly stronger than Go's own same-domain-or-subdomain rule.
+//     rather than an IP literal, port 443, and the host allow list, which is default-deny;
+//   - the Authorization AND Referer headers are deleted from every redirected request, whatever
+//     its target, which is strictly stronger than Go's own same-domain-or-subdomain rule.
 //
-// A hop is deliberately NOT required to stay on its original origin. Object storage is reached
-// exactly this way - an API-hosted URL answering 302 towards a storage host - so refusing to
-// follow it would reject a legitimate document permanently, and a permanent rejection here does
-// not merely lose diagnostics: GetUploadStats would answer non-200, the batch router would write
-// no job status, and the destination would stay blocked behind an unresolvable import. Nothing is
-// given up by allowing it, because the credential is stripped from every hop regardless of its
-// target and the dial control - not the hostname - is what actually keeps this request off
-// infrastructure it must not reach.
+// WHY Referer HAS TO GO, AND WHY DELETING IT HERE WORKS. This document can be served from object
+// storage through a PRE-SIGNED URL whose query string IS the credential. Before invoking
+// CheckRedirect, Go's http.Client populates the redirected request's Referer from the PREVIOUS
+// url - path and query string included - so a hop away from a pre-signed URL would hand that
+// signature to the next host in a header even though the Authorization header had been removed.
+// Go's own stripSensitiveHeaders drops Authorization and cookies on a cross-domain redirect but
+// never touches Referer, so an explicit deletion is required. CheckRedirect runs before the
+// request is sent and receives the outgoing *http.Request, which is why deleting it here is
+// effective rather than cosmetic.
+//
+// A hop must land on an allowed host, so a cross-origin hop is permitted only when its target is
+// itself allowed - which is exactly the same policy the first URL had to satisfy, applied again.
+// Object storage is reached this way, an API-hosted URL answering 302 towards a storage host, and
+// that keeps working as soon as the storage host is on the list; what is refused is a hop used to
+// walk off the enumerated set of hosts, which is the move that makes a redirect chain interesting
+// to an attacker in the first place.
 func newErrorsDocumentHTTPClient(allowedHosts []string) *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   errorsDocumentDialTimeout,
@@ -612,11 +660,17 @@ func newErrorsDocumentHTTPClient(allowedHosts []string) *http.Client {
 		Transport: transport,
 		Timeout:   errorsDocumentTimeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// The credential never crosses a redirect, whatever the target is.
+			// Neither the bearer credential nor the previous url crosses a redirect, whatever the
+			// target is. Referer would otherwise carry the previous url's path and query string,
+			// and for a pre-signed errors document that query string is itself a credential.
 			req.Header.Del("Authorization")
+			req.Header.Del("Referer")
 			if len(via) >= maxErrorsDocumentRedirects {
 				return fmt.Errorf("the errors document redirected more than %d times", maxErrorsDocumentRedirects)
 			}
+			// Same policy as the original url, allow list included, so a hop can never be used to
+			// walk off the enumerated set of hosts. validateErrorsURL is fail-closed, so this
+			// holds even if allowedHosts arrived empty.
 			if _, err := validateErrorsURL(req.URL.String(), allowedHosts); err != nil {
 				return fmt.Errorf("the errors document redirect was rejected: %w", err)
 			}
@@ -737,12 +791,13 @@ func isPubliclyRoutableAddr(addr netip.Addr) bool {
 // punycode host, and a port other than 443. Only after all of that does the caller decide
 // whether to attach the credential.
 //
-// The host allow list is an OPTIONAL, operator-supplied narrowing rather than the boundary
-// itself: an empty allowedHosts means every host that survives the checks above is acceptable,
-// because SendGrid publishes this URL and may legitimately serve the document from object
-// storage on a host this connector cannot know in advance. See defaultErrorsURLAllowedHosts for
-// why refusing such a URL is the more damaging failure, and for the protections that hold
-// regardless of the host.
+// The host allow list is then enforced UNCONDITIONALLY, and it is fail-closed: an empty
+// allowedHosts is read as "the caller has no effective list", not as "every host is acceptable",
+// and defaultErrorsURLAllowedHosts is substituted. Every caller therefore gets the default-deny
+// policy whether or not it remembered to resolve a list - including the redirect check in
+// newErrorsDocumentHTTPClient, which is the path an attacker would use to leave an allowed host.
+// See THE ERRORS-DOCUMENT HOST CONTRACT at the top of this file for why the host has to be
+// enumerated and what the accepted cost of that is.
 func validateErrorsURL(rawURL string, allowedHosts []string) (*url.URL, error) {
 	trimmed := strings.TrimSpace(rawURL)
 	if trimmed == "" {
@@ -785,9 +840,13 @@ func validateErrorsURL(rawURL string, allowedHosts []string) (*url.URL, error) {
 		return nil, newErrorsURLRejection(rejectionReasonPort,
 			fmt.Sprintf("the errors document url port %q is not allowed, 443 is required", port))
 	}
-	// Enforced only when an operator has actually narrowed the list; an empty list means no
-	// host narrowing is configured, which is the shipped default. See the contract above.
-	if len(allowedHosts) > 0 && !hostAllowed(host, allowedHosts) {
+	// Fail closed. An empty list is a caller that has no effective list, never a permissive one,
+	// so the shipped default-deny policy is substituted rather than skipped. See the contract above.
+	effectiveHosts := allowedHosts
+	if len(effectiveHosts) == 0 {
+		effectiveHosts = normalizeAllowedHosts(defaultErrorsURLAllowedHosts)
+	}
+	if !hostAllowed(host, effectiveHosts) {
 		// The message names both the host and the exact configuration key, because this is the
 		// one rejection an operator is expected to resolve rather than investigate. See the
 		// errors-document host contract at the top of this file.
@@ -1139,9 +1198,11 @@ func NewSendGridAPIService(destinationID string, destinationConfig DestinationCo
 		statsFactory = stats.NOP
 	}
 	// Both resolve BatchRouter.SENDGRID_BULK_UPLOAD.<key> and fall back to BatchRouter.<key>,
-	// defaulting to no host narrowing at all and to a generous document budget. Each goes
-	// through its own validating resolver rather than being trusted as read - see the
-	// errors-document host contract above and resolveMaxErrorsDocumentBytes below.
+	// defaulting to SendGrid's own domains for the errors-document host allow list - the policy is
+	// default-DENY - and to a generous document budget. Each goes through its own validating
+	// resolver rather than being trusted as read: an emptied allow-list override falls back to the
+	// default rather than to no list, and a nonsensical budget is clamped. See the errors-document
+	// host contract above and resolveMaxErrorsDocumentBytes below.
 	allowedHosts := resolveErrorsURLAllowedHosts()
 	maxErrorsDocumentBytes := resolveMaxErrorsDocumentBytes()
 	statLabels := stats.Tags{
