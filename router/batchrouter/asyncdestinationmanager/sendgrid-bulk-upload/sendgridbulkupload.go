@@ -3,11 +3,15 @@ package sendgridbulkupload
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/samber/lo"
 	"github.com/tidwall/gjson"
@@ -53,10 +57,8 @@ const (
 	// 6MB would therefore build bodies that are individually within the element budget yet
 	// over the wire limit once the envelope is added, and SendGrid would reject the request.
 	//
-	// 250,000 bytes is far more than the envelope can plausibly need - a list ID is a
-	// 36-character UUID, so even a thousand of them fit inside 40KB - and the same
-	// belt-and-braces sizing is the established precedent in this tree: the Klaviyo
-	// connector budgets 4,600,000 bytes against a 5MB API limit.
+	// The reserve is sized generously rather than calculated, because the number of list IDs a
+	// destination targets is operator-controlled and therefore not knowable here.
 	requestEnvelopeReserveBytes = 250 * 1000
 
 	// defaultMaxContactsPerRequest is the element cap used when nothing overrides it.
@@ -159,11 +161,36 @@ const (
 	// reasonContactTooLarge is recorded when a single contact is larger than an entire
 	// request's byte budget, so no chunk could ever hold it.
 	reasonContactTooLarge = "the contact is larger than the maximum sendgrid request size and cannot be uploaded in any batch"
+
+	// reasonMalformedRecord is recorded when a staging-file line is malformed yet still names
+	// the job that produced it.
+	reasonMalformedRecord = "the staging file record for this job is malformed and cannot be turned into a sendgrid contact"
 )
 
 // defaultFailureReason is recorded for an errored row whose document carried no message, so
 // that a job is never marked failed with an empty explanation.
 const defaultFailureReason = "sendgrid reported an error for this contact without a message"
+
+// maxReasonRunes bounds every provider-supplied message this connector records against a job or
+// writes to a log, so that a verbose or hostile response cannot bloat the jobs database.
+const maxReasonRunes = 512
+
+// Bounds applied to the errors document while it is parsed.
+//
+// The transport adapter already bounds how many BYTES are read; these bound what the parser is
+// prepared to build out of them, so that a document within the byte budget still cannot turn
+// into an unbounded number of rows or an unbounded nesting depth.
+const (
+	// maxErrorRows bounds how many rows are taken from the document. It sits far above the
+	// 30,000 contacts one request can carry, so it can only be reached by a document that does
+	// not describe a single import.
+	maxErrorRows = 100000
+
+	// maxErrorsDocumentDepth bounds the document's JSON nesting depth. Every shape the parser
+	// accepts is at most three levels deep, so this leaves ample room while still rejecting a
+	// document built to exhaust the decoder.
+	maxErrorsDocumentDepth = 32
+)
 
 // Compile-time proof that this manager satisfies the full four-method async destination
 // manager contract, so that any drift in the shared interface breaks the build here rather
@@ -263,21 +290,25 @@ func (*SendGridBulkUploader) Transform(job *jobsdb.JobT) (string, error) {
 //
 // A zero or negative field falls back to the documented default, so an uploader built as a
 // struct literal - which is how the tests construct it - is always usable and can shrink the
-// cap simply by setting it.
+// cap simply by setting it. An override is CLAMPED to the endpoint's documented ceiling: a
+// larger value could only produce requests SendGrid rejects, so honouring it would turn a
+// configuration mistake into a delivery failure.
 func (b *SendGridBulkUploader) maxContactsPerRequest() int {
-	if b.MaxContactsPerRequest > 0 {
-		return b.MaxContactsPerRequest
+	if b.MaxContactsPerRequest <= 0 {
+		return defaultMaxContactsPerRequest
 	}
-	return defaultMaxContactsPerRequest
+	return min(b.MaxContactsPerRequest, sendGridMaxContactsPerRequest)
 }
 
 // maxRequestBytes is the effective byte cap for one upsert's contacts, envelope reserve
-// already deducted. A zero or negative field falls back to the documented default.
+// already deducted. A zero or negative field falls back to the documented default, and an
+// override is clamped to the documented ceiling less the reserve for the same reason the
+// element cap is.
 func (b *SendGridBulkUploader) maxRequestBytes() int {
-	if b.MaxRequestBytes > 0 {
-		return b.MaxRequestBytes
+	if b.MaxRequestBytes <= 0 {
+		return defaultMaxRequestBytes
 	}
-	return defaultMaxRequestBytes
+	return min(b.MaxRequestBytes, defaultMaxRequestBytes)
 }
 
 // statLabels are the tags every measurement this connector emits carries.
@@ -463,10 +494,54 @@ type stagedContacts struct {
 	// permanent, so these are reported on the terminal channel.
 	rejectedJobIDs []int64
 
-	// unattributableLines counts lines that carried no job ID at all. Such a line cannot be
-	// reported against any job, so it is counted and logged instead of being discarded in
-	// silence.
-	unattributableLines int
+	// malformedJobIDs are jobs whose staging line was malformed but still carried a usable job
+	// ID. The same bytes would fail identically on every retry, so these are reported on the
+	// terminal channel, exactly like a contact that carries no identifier.
+	malformedJobIDs []int64
+}
+
+// parseStagingLine validates one staging-file line and returns the originating job ID together
+// with the message object the contact is built from.
+//
+// Validation happens BEFORE either field is consumed. gjson is a deliberately tolerant reader:
+// asked for metadata.job_id on a line that is not JSON, or that carries no metadata at all, it
+// answers with a zero value that is indistinguishable from legitimately absent data - most
+// damagingly job ID 0, which belongs to no job and must never reach the batch router.
+//
+// The returned job ID carries the recoverability of the failure, which is what lets the caller
+// choose the right outcome without a second error type: 0 alongside an error means the line
+// could not be attributed to any job, so the batch must be retried rather than an attribution
+// invented; a non-zero job ID alongside an error means the line was malformed but attributable,
+// so only that one record need be rejected.
+func parseStagingLine(line []byte) (int64, gjson.Result, error) {
+	if !gjson.ValidBytes(line) {
+		return 0, gjson.Result{}, errors.New("the staging file line is not valid JSON")
+	}
+	record := gjson.ParseBytes(line)
+	if !record.IsObject() {
+		return 0, gjson.Result{}, errors.New("the staging file line is not a JSON object")
+	}
+
+	// job_id, not jobId: that is the key the shared marshalling helper actually writes.
+	jobIDResult := record.Get("metadata.job_id")
+	if jobIDResult.Type != gjson.Number && jobIDResult.Type != gjson.String {
+		// A numeric string is accepted alongside a number purely defensively: it is still an
+		// attributable job ID, and recovering the attribution always beats failing the batch.
+		return 0, gjson.Result{}, fmt.Errorf("the staging file line carries no numeric metadata.job_id (found %s)", jobIDResult.Type)
+	}
+	jobID := jobIDResult.Int()
+	if jobID <= 0 {
+		// Zero is unattributable, and so is a negative value: job IDs are positive, so a
+		// negative one would name a job that cannot exist.
+		return 0, gjson.Result{}, errors.New("the staging file line carries an unusable metadata.job_id")
+	}
+
+	message := record.Get("message")
+	if !message.IsObject() {
+		// The job ID is known, so this record - and only this record - is rejected.
+		return jobID, gjson.Result{}, errors.New("the staging file line carries no message object")
+	}
+	return jobID, message, nil
 }
 
 // readStagedContacts reads a staging file into list-ID-grouped batches of contacts.
@@ -475,11 +550,17 @@ type stagedContacts struct {
 // The job ID is read from metadata.job_id - the key the shared marshalling helper actually
 // writes - and the contact is derived from message.
 //
-// A line that cannot be attributed to a job, and a line whose event yields no usable
-// contact, are both skipped INDIVIDUALLY: one unusable record must never prevent the rest of
-// the batch from being delivered. A read or scan failure, by contrast, aborts the whole read
-// and is returned as an error, because a partially read file would silently drop every line
-// after the failure.
+// Every line is VALIDATED BEFORE either field is consumed, because gjson is a deliberately
+// tolerant reader: on a line that is not JSON at all, or that carries no metadata, it yields
+// zero values indistinguishable from legitimately absent data. A line whose event yields no
+// usable contact is skipped INDIVIDUALLY, because one unusable record must never prevent the
+// rest of the batch from being delivered.
+//
+// A line that cannot be attributed to ANY job is different in kind: nothing can be reported
+// against it, and continuing would leave the job that produced it silently unaccounted for. It
+// therefore aborts the whole read and is returned as an error, which the caller reports as a
+// retryable batch failure - the same treatment a read or scan failure gets, because a partially
+// read file would likewise drop every line after the failure.
 func (b *SendGridBulkUploader) readStagedContacts(filePath string, statLabels stats.Tags) (*stagedContacts, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -497,17 +578,31 @@ func (b *SendGridBulkUploader) readStagedContacts(filePath string, statLabels st
 	scanner.Buffer(nil, int(common.GetBatchRouterConfigInt64(configKeyMaxBufferCapacity, destName, defaultMaxBufferCapacity)))
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		jobIDResult := gjson.GetBytes(line, "metadata.job_id")
-		jobID := jobIDResult.Int()
-		if !jobIDResult.Exists() || jobID == 0 {
-			// Nothing can be reported against this line, so it is surfaced through a metric
-			// and a log rather than dropped quietly.
-			staged.unattributableLines++
-			b.Logger.Warnn("[sendgrid bulk upload] staging file line carried no usable job id")
+		if len(bytes.TrimSpace(line)) == 0 {
+			// A blank line carries no record at all - a trailing newline is entirely normal -
+			// so it is skipped rather than charged against any job.
 			continue
 		}
 
-		message := gjson.GetBytes(line, "message")
+		jobID, message, err := parseStagingLine(line)
+		if err != nil {
+			if jobID == 0 {
+				// The line belongs to no job this connector can name. Reporting it against job
+				// ID 0 would name a job that does not exist while leaving the real one
+				// unaccounted for, so the whole read fails and the caller retries the batch.
+				b.Logger.Errorn("[sendgrid bulk upload] staging file line could not be attributed to a job",
+					obskit.Error(err))
+				return nil, fmt.Errorf("reading staging file: %w", err)
+			}
+			// Malformed but attributable: the same bytes would fail identically on every
+			// retry, so this single record is rejected permanently and the batch proceeds.
+			staged.malformedJobIDs = append(staged.malformedJobIDs, jobID)
+			b.Logger.Errorn("[sendgrid bulk upload] skipping malformed staging file line",
+				logger.NewIntField("jobID", jobID),
+				obskit.Error(err))
+			continue
+		}
+
 		contact, err := b.buildContact(message)
 		if err != nil {
 			staged.rejectedJobIDs = append(staged.rejectedJobIDs, jobID)
@@ -559,6 +654,14 @@ func (b *SendGridBulkUploader) readStagedContacts(filePath string, statLabels st
 //
 // The caps are supplied by the caller's accessors, which guarantee positive values.
 func chunkBySizeAndElements(contacts []Contact, jobIDs []int64, maxBytes, maxElements int) ([][]Contact, [][]int64, []int64, error) {
+	// Every contact is paired with the job that produced it, so the two inputs are read in
+	// lockstep below. The pairing is reported as an error rather than being assumed, because
+	// indexing one slice with the other's offset would panic inside a batch router worker and
+	// take down far more than the one upload that was actually malformed.
+	if len(contacts) != len(jobIDs) {
+		return nil, nil, nil, fmt.Errorf("%d contacts cannot be paired with %d job ids", len(contacts), len(jobIDs))
+	}
+
 	var (
 		contactChunks   [][]Contact
 		jobIDChunks     [][]int64
@@ -652,12 +755,6 @@ func (b *SendGridBulkUploader) Upload(asyncDestStruct *common.AsyncDestinationSt
 			DestinationID: destinationID,
 		}
 	}
-	if staged.unattributableLines > 0 {
-		// Not an aborted-delivery metric - these lines belong to no job and so never reach a
-		// job state at all. It exists so that a staging-file shape change becomes visible as
-		// a metric instead of as quietly missing contacts.
-		b.StatsFactory.NewTaggedStat("invalid_record_count", stats.CountType, statLabels).Count(staged.unattributableLines)
-	}
 
 	var (
 		importIDs      []string
@@ -669,6 +766,13 @@ func (b *SendGridBulkUploader) Upload(asyncDestStruct *common.AsyncDestinationSt
 	if len(staged.rejectedJobIDs) > 0 {
 		abortedJobIDs = append(abortedJobIDs, staged.rejectedJobIDs...)
 		abortReasons = append(abortReasons, reasonMissingIdentifier)
+	}
+	if len(staged.malformedJobIDs) > 0 {
+		abortedJobIDs = append(abortedJobIDs, staged.malformedJobIDs...)
+		abortReasons = append(abortReasons, reasonMalformedRecord)
+		// Surfaced as a metric as well, so that a staging-file shape change is visible without
+		// having to read logs.
+		b.StatsFactory.NewTaggedStat("invalid_record_count", stats.CountType, statLabels).Count(len(staged.malformedJobIDs))
 	}
 
 	for _, batch := range staged.batches {
@@ -933,7 +1037,7 @@ func (b *SendGridBulkUploader) Poll(pollInput common.AsyncPoll) common.PollStatu
 			return common.PollStatusResponse{
 				StatusCode: http.StatusInternalServerError,
 				Complete:   false,
-				Error:      fmt.Sprintf("Unknown status: %s", importStatus.Status),
+				Error:      sanitizeReason(fmt.Sprintf("Unknown status: %s", importStatus.Status)),
 			}
 		}
 	}
@@ -956,7 +1060,7 @@ func (b *SendGridBulkUploader) Poll(pollInput common.AsyncPoll) common.PollStatu
 			StatusCode: http.StatusBadRequest,
 			Complete:   true,
 			HasFailed:  true,
-			Error:      fmt.Sprintf("SendGrid Bulk Upload Failed: %s", strings.Join(details, "; ")),
+			Error:      sanitizeReason(fmt.Sprintf("SendGrid Bulk Upload Failed: %s", strings.Join(details, "; "))),
 		}
 	}
 
@@ -969,7 +1073,7 @@ func (b *SendGridBulkUploader) Poll(pollInput common.AsyncPoll) common.PollStatu
 			// one would be a guess. GetUploadStats falls back to re-reading the import status
 			// when this is empty.
 			FailedJobParameters: strings.Join(errorsURLs, errorsURLSeparator),
-			Error:               fmt.Sprintf("SendGrid Bulk Upload partially failed: %s", strings.Join(details, "; ")),
+			Error:               sanitizeReason(fmt.Sprintf("SendGrid Bulk Upload partially failed: %s", strings.Join(details, "; "))),
 		}
 	}
 
@@ -995,17 +1099,17 @@ func (b *SendGridBulkUploader) pollErrorResponse(err error, importID string) com
 		return common.PollStatusResponse{
 			StatusCode: http.StatusTooManyRequests,
 			Complete:   false,
-			Error:      rateLimitErr.Error(),
+			Error:      sanitizeReason(rateLimitErr.Error()),
 		}
 	}
 	b.Logger.Errorn("[sendgrid bulk upload] unable to read import status",
-		obskit.Error(err),
+		logger.NewStringField("error", sanitizeReason(err.Error())),
 		obskit.DestinationID(b.DestinationID),
 		logger.NewStringField("importId", importID))
 	return common.PollStatusResponse{
 		StatusCode: http.StatusInternalServerError,
 		Complete:   false,
-		Error:      err.Error(),
+		Error:      sanitizeReason(err.Error()),
 	}
 }
 
@@ -1026,7 +1130,10 @@ func (b *SendGridBulkUploader) pollErrorResponse(err error, importID string) com
 //
 // Every path that cannot establish which rows failed returns a non-200 status so the batch
 // router retries, because returning 200 with an empty failed set would mark every job in the
-// import succeeded - the exact silent data loss this method exists to prevent.
+// import succeeded - the exact silent data loss this method exists to prevent. That includes an
+// errored row whose identifier resolves to no importing job: counting and logging such a row
+// makes a change in the undocumented document shape observable, but it cannot attribute the row,
+// so only the non-200 keeps the affected contact from being delivered by exclusion.
 func (b *SendGridBulkUploader) GetUploadStats(input common.GetUploadStatsInput) common.GetUploadStatsResponse {
 	errorsURLs, response := b.resolveErrorsURLs(input)
 	if len(errorsURLs) == 0 {
@@ -1038,11 +1145,11 @@ func (b *SendGridBulkUploader) GetUploadStats(input common.GetUploadStatsInput) 
 		document, err := b.SendGridAPIService.GetImportErrors(errorsURL)
 		if err != nil {
 			b.Logger.Errorn("[sendgrid bulk upload] unable to fetch the errors document",
-				obskit.Error(err),
+				logger.NewStringField("error", sanitizeReason(err.Error())),
 				obskit.DestinationID(b.DestinationID))
 			return common.GetUploadStatsResponse{
 				StatusCode: http.StatusInternalServerError,
-				Error:      "Failed to fetch the sendgrid errors document: " + err.Error(),
+				Error:      sanitizeReason("Failed to fetch the sendgrid errors document: " + err.Error()),
 			}
 		}
 		parsedRows, err := parseImportErrors(document)
@@ -1050,11 +1157,11 @@ func (b *SendGridBulkUploader) GetUploadStats(input common.GetUploadStatsInput) 
 			// The document could not be understood at all. Retrying is the safe failure mode:
 			// reporting success here would silently deliver contacts SendGrid rejected.
 			b.Logger.Errorn("[sendgrid bulk upload] unable to parse the errors document",
-				obskit.Error(err),
+				logger.NewStringField("error", sanitizeReason(err.Error())),
 				obskit.DestinationID(b.DestinationID))
 			return common.GetUploadStatsResponse{
 				StatusCode: http.StatusInternalServerError,
-				Error:      "Failed to parse the sendgrid errors document: " + err.Error(),
+				Error:      sanitizeReason("Failed to parse the sendgrid errors document: " + err.Error()),
 			}
 		}
 		rows = append(rows, parsedRows...)
@@ -1071,27 +1178,65 @@ func (b *SendGridBulkUploader) GetUploadStats(input common.GetUploadStatsInput) 
 	}
 
 	lookup := b.buildIdentifierLookup(input.ImportingList)
-	unmatchedRows := 0
+	unmatchedRows, ambiguousRows := 0, 0
 	for _, row := range rows {
-		jobID, ok := lookup[strings.ToLower(strings.TrimSpace(row.Identifier))]
-		if !ok {
-			// Counted and logged, never discarded in silence: an unresolvable identifier means
-			// the errors document's shape has moved, and that has to show up in metrics rather
-			// than as contacts quietly reported as delivered.
+		jobIDs, ok := lookup[strings.ToLower(strings.TrimSpace(row.Identifier))]
+		if !ok || len(jobIDs) == 0 {
+			// Counted and logged so that a change in the undocumented document shape becomes
+			// visible in metrics. The identifier is fingerprinted rather than logged verbatim,
+			// because it is personal data, and the row's own message is sanitized because it can
+			// echo the rejected contact's address back.
+			//
+			// Observability alone would NOT make this safe: an unattributed row's job would be
+			// marked succeeded by exclusion, so the reconciliation is failed closed below
+			// instead, and it is that non-200 - not this log line - that prevents the loss.
 			unmatchedRows++
 			b.Logger.Warnn("[sendgrid bulk upload] errored row could not be matched to an importing job",
 				obskit.DestinationID(b.DestinationID),
-				logger.NewStringField("identifier", row.Identifier),
-				logger.NewStringField("reason", row.Message))
+				logger.NewStringField("identifierFingerprint", redactIdentifier(row.Identifier)),
+				logger.NewStringField("reason", sanitizeReason(row.Message)))
 			continue
 		}
-		if _, seen := metadata.FailedReasons[jobID]; !seen {
-			metadata.FailedKeys = append(metadata.FailedKeys, jobID)
+		reason := coalesce(sanitizeReason(row.Message), defaultFailureReason)
+		if len(jobIDs) > 1 {
+			// The identifier is ambiguous - two staged events carried it, so SendGrid upserted
+			// them onto one contact - and the failure cannot be attributed to just one of them.
+			// EVERY candidate is failed: failing a job that in fact succeeded costs one
+			// idempotent re-upsert, whereas reporting a failed contact as delivered loses it.
+			ambiguousRows++
+			reason = fmt.Sprintf("%s (this contact identifier matches %d jobs, so all of them are retried)", reason, len(jobIDs))
+			b.Logger.Warnn("[sendgrid bulk upload] errored row matches more than one importing job",
+				obskit.DestinationID(b.DestinationID),
+				logger.NewIntField("jobCount", int64(len(jobIDs))),
+				logger.NewStringField("identifierFingerprint", redactIdentifier(row.Identifier)))
 		}
-		metadata.FailedReasons[jobID] = coalesce(strings.TrimSpace(row.Message), defaultFailureReason)
+		for _, jobID := range jobIDs {
+			if _, seen := metadata.FailedReasons[jobID]; !seen {
+				metadata.FailedKeys = append(metadata.FailedKeys, jobID)
+			}
+			metadata.FailedReasons[jobID] = reason
+		}
 	}
 	if unmatchedRows > 0 {
 		b.StatsFactory.NewTaggedStat("unmatched_error_row_count", stats.CountType, b.statLabels(b.DestinationID)).Count(unmatchedRows)
+	}
+	if ambiguousRows > 0 {
+		b.StatsFactory.NewTaggedStat("ambiguous_error_row_count", stats.CountType, b.statLabels(b.DestinationID)).Count(ambiguousRows)
+	}
+	if unmatchedRows > 0 {
+		// FAIL CLOSED. The reconciliation is incomplete, so no job may be marked succeeded from
+		// it: succeeded-by-exclusion would deliver exactly the contacts whose rows could not be
+		// attributed. A retryable status makes the batch router poll again, and abort only once
+		// its retry budget is spent.
+		b.Logger.Errorn("[sendgrid bulk upload] refusing to reconcile an import with unattributable errored rows",
+			obskit.DestinationID(b.DestinationID),
+			logger.NewIntField("unmatchedRowCount", int64(unmatchedRows)),
+			logger.NewIntField("rowCount", int64(len(rows))))
+		return common.GetUploadStatsResponse{
+			StatusCode: http.StatusInternalServerError,
+			Error: fmt.Sprintf("%d of %d sendgrid errored rows could not be attributed to an importing job",
+				unmatchedRows, len(rows)),
+		}
 	}
 
 	// Succeeded by exclusion: every importing job that no errored row resolved to was
@@ -1149,7 +1294,7 @@ func (b *SendGridBulkUploader) resolveErrorsURLs(input common.GetUploadStatsInpu
 			obskit.DestinationID(b.DestinationID))
 		return nil, common.GetUploadStatsResponse{
 			StatusCode: http.StatusInternalServerError,
-			Error:      "Failed to parse parameters: " + err.Error(),
+			Error:      sanitizeReason("Failed to parse parameters: " + err.Error()),
 		}
 	}
 
@@ -1158,12 +1303,12 @@ func (b *SendGridBulkUploader) resolveErrorsURLs(input common.GetUploadStatsInpu
 		importStatus, err := b.SendGridAPIService.GetImportStatus(importID)
 		if err != nil {
 			b.Logger.Errorn("[sendgrid bulk upload] unable to re-read import status while reconciling",
-				obskit.Error(err),
+				logger.NewStringField("error", sanitizeReason(err.Error())),
 				obskit.DestinationID(b.DestinationID),
 				logger.NewStringField("importId", importID))
 			return nil, common.GetUploadStatsResponse{
 				StatusCode: http.StatusInternalServerError,
-				Error:      "Failed to fetch the sendgrid import status: " + err.Error(),
+				Error:      sanitizeReason("Failed to fetch the sendgrid import status: " + err.Error()),
 			}
 		}
 		errorsURLs = appendErrorsURL(errorsURLs, importStatus)
@@ -1183,15 +1328,18 @@ func (b *SendGridBulkUploader) resolveErrorsURLs(input common.GetUploadStatsInpu
 // carry, so that an errored row can be resolved back to the job that produced it with no state
 // retained from the upload.
 //
-// Every identifier is indexed - the email first and foremost, but the external, anonymous and
-// phone identifiers too - because the errors document is free to report whichever of them it
-// likes and this connector cannot dictate the choice. All keys are lower-cased, which is what
-// makes matching insensitive to SendGrid's own normalization of the email address.
+// All four identifiers SendGrid accepts are indexed - the email first and foremost, but the
+// external, anonymous and phone identifiers too - because the errors document is free to report
+// whichever of them it likes and this connector cannot dictate the choice. All keys are
+// lower-cased, which is what makes matching insensitive to SendGrid's own normalization of the
+// email address.
 //
-// The first job to claim an identifier keeps it, so that two jobs carrying the same address
-// resolve deterministically rather than according to map iteration order.
-func (b *SendGridBulkUploader) buildIdentifierLookup(importingList []*jobsdb.JobT) map[string]int64 {
-	lookup := make(map[string]int64, len(importingList))
+// An identifier maps to EVERY job that claimed it, not just the first. Two staged events can
+// legitimately carry the same address - SendGrid upserts them onto one contact - and in that
+// case the errored row genuinely refers to both, so keeping only one would let the other be
+// marked succeeded by exclusion even though its contact failed.
+func (b *SendGridBulkUploader) buildIdentifierLookup(importingList []*jobsdb.JobT) map[string][]int64 {
+	lookup := make(map[string][]int64, len(importingList))
 	for _, job := range importingList {
 		if job == nil {
 			continue
@@ -1203,16 +1351,49 @@ func (b *SendGridBulkUploader) buildIdentifierLookup(importingList []*jobsdb.Job
 			b.Logger.Warnn("[sendgrid bulk upload] importing job carries no contact identifier",
 				obskit.DestinationID(b.DestinationID),
 				logger.NewIntField("jobID", job.JobID),
-				obskit.Error(err))
+				logger.NewStringField("error", sanitizeReason(err.Error())))
 			continue
 		}
 		for _, identifier := range identifiersOf(contact) {
-			if _, exists := lookup[identifier]; !exists {
-				lookup[identifier] = job.JobID
+			if !lo.Contains(lookup[identifier], job.JobID) {
+				lookup[identifier] = append(lookup[identifier], job.JobID)
 			}
 		}
 	}
 	return lookup
+}
+
+// jsonDepth reports the deepest nesting of a JSON document, ignoring braces and brackets that
+// appear inside string literals. It works on raw bytes so the depth can be bounded BEFORE the
+// document is handed to a decoder.
+func jsonDepth(document []byte) int {
+	var depth, maxDepth int
+	inString, escaped := false, false
+	for _, character := range document {
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case character == '\\':
+				escaped = true
+			case character == '"':
+				inString = false
+			}
+			continue
+		}
+		switch character {
+		case '"':
+			inString = true
+		case '{', '[':
+			depth++
+			if depth > maxDepth {
+				maxDepth = depth
+			}
+		case '}', ']':
+			depth--
+		}
+	}
+	return maxDepth
 }
 
 // parseImportErrors decodes the document SendGrid publishes for an import's errored rows.
@@ -1241,12 +1422,23 @@ func parseImportErrors(document []byte) ([]ImportErrorRow, error) {
 	if len(trimmed) == 0 {
 		return nil, errors.New("the errors document is empty")
 	}
+	// Depth is checked before the document is decoded, because decoding a deeply nested value
+	// is what costs the memory and the stack: the check has to happen while the input is still
+	// just bytes. The document's schema is not published, so no legitimate shape is anywhere
+	// near this bound.
+	if depth := jsonDepth(trimmed); depth > maxErrorsDocumentDepth {
+		return nil, fmt.Errorf("the errors document is nested %d levels deep, more than the %d allowed", depth, maxErrorsDocumentDepth)
+	}
 
 	var probe any
 	if err := jsonrs.Unmarshal(trimmed, &probe); err == nil {
 		root := gjson.ParseBytes(trimmed)
 		if root.IsArray() {
-			if rows := importErrorRowsFrom(root.Array()); len(rows) > 0 {
+			entries := root.Array()
+			if len(entries) > maxErrorRows {
+				return nil, fmt.Errorf("the errors document holds %d rows, more than the %d allowed", len(entries), maxErrorRows)
+			}
+			if rows := importErrorRowsFrom(entries); len(rows) > 0 {
 				return rows, nil
 			}
 			return nil, errors.New("the errors document is an array carrying no recognizable rows")
@@ -1254,7 +1446,11 @@ func parseImportErrors(document []byte) ([]ImportErrorRow, error) {
 		if root.IsObject() {
 			for _, key := range []string{"errors", "results"} {
 				if wrapped := root.Get(key); wrapped.IsArray() {
-					if rows := importErrorRowsFrom(wrapped.Array()); len(rows) > 0 {
+					entries := wrapped.Array()
+					if len(entries) > maxErrorRows {
+						return nil, fmt.Errorf("the errors document's %q array holds %d rows, more than the %d allowed", key, len(entries), maxErrorRows)
+					}
+					if rows := importErrorRowsFrom(entries); len(rows) > 0 {
 						return rows, nil
 					}
 					return nil, fmt.Errorf("the errors document's %q array carries no recognizable rows", key)
@@ -1297,6 +1493,9 @@ func parseNewlineDelimitedImportErrors(document []byte) ([]ImportErrorRow, error
 			continue
 		}
 		if row, ok := importErrorRowFrom(parsed); ok {
+			if len(rows) >= maxErrorRows {
+				return nil, fmt.Errorf("the errors document holds more than the %d allowed rows", maxErrorRows)
+			}
 			rows = append(rows, row)
 		}
 	}
@@ -1353,6 +1552,73 @@ func identifiersOf(contact Contact) []string {
 		}
 	}
 	return lo.Uniq(identifiers)
+}
+
+// emailPattern and longNumberPattern recognize the two personally identifiable shapes that
+// realistically appear inside a provider-supplied message, which is text this connector does not
+// control yet has to record against a job.
+//
+// longNumberPattern deliberately requires at least nine digits: long enough to cover a phone
+// number or a numeric account identifier, and short enough to leave the values an operator needs
+// untouched - a date, an RFC3339 rate-limit reset instant, a quota or a byte count.
+var (
+	emailPattern      = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)
+	longNumberPattern = regexp.MustCompile(`\+?\d(?:[\s().-]?\d){8,}`)
+)
+
+// redactIdentifier turns a contact identifier into a short, stable, non-reversible fingerprint.
+//
+// An identifier is personal data - an email address, a phone number, an account ID - so it is
+// never written to a log verbatim. The fingerprint still lets the same identifier be correlated
+// across log lines during an investigation, which is the only thing an operator needs it for.
+func redactIdentifier(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(strings.ToLower(trimmed)))
+	return hex.EncodeToString(digest[:])[:16]
+}
+
+// sanitizeReason prepares provider-supplied text for somewhere it is KEPT: a job status that is
+// persisted in the jobs database, or a log line.
+//
+// The connector is required to record SendGrid's explanation for a failed contact, and that text
+// is outside its control: it can echo the rejected contact's own email or phone number, it can
+// carry control characters that would corrupt a structured log stream, and it has no length
+// bound. Recognizable personal shapes are therefore redacted, control and non-printable
+// characters are dropped, whitespace is collapsed to single spaces, and the result is length
+// capped.
+func sanitizeReason(reason string) string {
+	if reason == "" {
+		return ""
+	}
+	redacted := emailPattern.ReplaceAllString(reason, "<redacted-email>")
+	redacted = longNumberPattern.ReplaceAllString(redacted, "<redacted-number>")
+
+	var builder strings.Builder
+	builder.Grow(len(redacted))
+	pendingSpace := false
+	for _, character := range redacted {
+		switch {
+		case unicode.IsSpace(character):
+			pendingSpace = builder.Len() > 0
+		case unicode.IsControl(character) || !unicode.IsPrint(character):
+			// Dropped entirely: it carries no diagnostic value and can corrupt a log stream.
+		default:
+			if pendingSpace {
+				builder.WriteRune(' ')
+				pendingSpace = false
+			}
+			builder.WriteRune(character)
+		}
+	}
+	sanitized := strings.TrimSpace(builder.String())
+	runes := []rune(sanitized)
+	if len(runes) <= maxReasonRunes {
+		return sanitized
+	}
+	return string(runes[:maxReasonRunes]) + " ... (truncated)"
 }
 
 // stagedMessage extracts the event message from an importing job's payload.
@@ -1445,11 +1711,18 @@ func listIDsKey(listIDs []string) string {
 // joinReasons renders several failure reasons as one, dropping blanks and repetitions so that a
 // reason recorded once per rejected chunk does not become an unreadable wall of duplicates in a
 // job's error response.
+//
+// It is also the single place the two durable upload reasons are sanitized. A reason can quote
+// SendGrid's own response, which is text this connector does not control and which can echo a
+// rejected contact's address; these strings are persisted with the job, so they are cleaned of
+// personal shapes and control characters and length capped before they get there. The rate-limit
+// reset window survives verbatim, which is what keeps the 429 reason actionable.
 func joinReasons(reasons []string) string {
-	present := lo.Filter(reasons, func(reason string, _ int) bool {
-		return strings.TrimSpace(reason) != ""
+	sanitized := lo.FilterMap(reasons, func(reason string, _ int) (string, bool) {
+		clean := sanitizeReason(reason)
+		return clean, clean != ""
 	})
-	return strings.Join(lo.Uniq(present), "; ")
+	return strings.Join(lo.Uniq(sanitized), "; ")
 }
 
 // firstResult returns the first of the given paths that is present, or the zero result when none

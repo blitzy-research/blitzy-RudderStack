@@ -2,12 +2,15 @@ package sendgridbulkupload
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/rudderlabs/rudder-go-kit/jsonrs"
@@ -15,6 +18,7 @@ import (
 	"github.com/rudderlabs/rudder-go-kit/stats"
 	obskit "github.com/rudderlabs/rudder-observability-kit/go/labels"
 	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
+	"github.com/rudderlabs/rudder-server/router/batchrouter/asyncdestinationmanager/common"
 )
 
 // SendGrid Marketing Contacts endpoints.
@@ -23,8 +27,13 @@ import (
 // publishes exactly one global API host for the v3 Web API, so making the origin settable
 // would create nothing but a way to misconfigure a destination.
 const (
+	// sendGridAPIHost is the only host this adapter builds a request against itself, and the
+	// only host the bearer credential may ever be sent to. sendGridBaseURL is derived from it
+	// so the two can never drift apart.
+	sendGridAPIHost = "api.sendgrid.com"
+
 	// sendGridBaseURL is the single origin every call in this adapter is made against.
-	sendGridBaseURL = "https://api.sendgrid.com"
+	sendGridBaseURL = "https://" + sendGridAPIHost
 
 	// sendGridContactsEndpoint is the Marketing Contacts upsert endpoint, driven with PUT.
 	// It is corroborated in-repo by the read-only SendGrid parity fixture, which records
@@ -76,6 +85,64 @@ const (
 	defaultMaxConnsPerHost     = 100
 )
 
+// Response-size budgets.
+//
+// Every response this adapter reads is read through a budget, because an unbounded read of a
+// remote body lets the remote side decide how much memory this process allocates. Exceeding a
+// budget is reported as an error rather than truncated silently: a truncated document parses
+// as a shorter, different document, which for the errors document would mean reporting failed
+// contacts as delivered.
+const (
+	// maxAPIResponseBytes bounds the two small JSON documents the API itself returns. An
+	// upsert acknowledgement and an import status are a few hundred bytes; a megabyte leaves
+	// generous room for an unexpected error page while still bounding the allocation.
+	maxAPIResponseBytes int64 = 1 * 1024 * 1024
+
+	// defaultMaxErrorsDocumentBytes bounds the errors document, which is the only response
+	// whose size is driven by data volume rather than by a fixed schema. It is overridable
+	// through configuration because the document's format is not published, so its size per
+	// errored row cannot be predicted.
+	defaultMaxErrorsDocumentBytes int64 = 32 * 1024 * 1024
+)
+
+// Settings for the one request whose target is chosen by the remote side.
+const (
+	// errorsDocumentTimeout is more generous than defaultTimeout because the errors document
+	// can be substantially larger than an API response.
+	errorsDocumentTimeout = 60 * time.Second
+
+	// errorsDocumentDialTimeout bounds a single connection attempt to the errors document's
+	// host, which is not necessarily the API host.
+	errorsDocumentDialTimeout = 10 * time.Second
+
+	// maxErrorsDocumentRedirects bounds the redirect chain the errors document fetch follows.
+	maxErrorsDocumentRedirects = 3
+
+	// maxErrorsURLLength bounds the length of the provider-supplied URL before it is parsed.
+	maxErrorsURLLength = 2048
+)
+
+// sendGridHostSuffixes are the domains SendGrid itself serves. They are the ONLY hosts the
+// bearer credential may be attached to, so that a URL published by the provider can never
+// carry this destination's API key anywhere else.
+var sendGridHostSuffixes = []string{"sendgrid.com", "sendgrid.net"}
+
+// defaultErrorsURLAllowedHosts is the default allow list applied to the errors document URL.
+//
+// It holds SendGrid's own domains only. When SendGrid serves the document from object storage
+// instead, the operator widens the list through
+// BatchRouter.SENDGRID_BULK_UPLOAD.errorsURLAllowedHosts - and the rejection error names that
+// key, so the required action is self-evident from the failure. Widening the list does NOT
+// widen the credential: the key is still attached only for the hosts above.
+var defaultErrorsURLAllowedHosts = []string{"sendgrid.com", "sendgrid.net"}
+
+// configKeyErrorsURLAllowedHosts and configKeyMaxErrorsDocumentBytes resolve
+// BatchRouter.SENDGRID_BULK_UPLOAD.<key> and fall back to BatchRouter.<key>.
+const (
+	configKeyErrorsURLAllowedHosts  = "errorsURLAllowedHosts"
+	configKeyMaxErrorsDocumentBytes = "maxErrorsDocumentBytes"
+)
+
 // getDefaultHTTPClient returns an http.Client with standard configuration
 func getDefaultHTTPClient() *http.Client {
 	transport := &http.Transport{
@@ -92,16 +159,218 @@ func getDefaultHTTPClient() *http.Client {
 	}
 }
 
-// setRequestHeaders applies the two headers every SendGrid Marketing Contacts call needs.
+// newErrorsDocumentHTTPClient builds the client used for the one request whose target is
+// chosen by the remote side rather than by this adapter.
 //
-// SendGrid authenticates the v3 Web API with a static bearer credential, so there is no
-// token exchange, no refresh and no OAuth subsystem involved here at all. Content-Type is
-// strictly required only on the upsert, which is the one call that carries a body, but it
-// is set unconditionally so the header logic lives in exactly one place and cannot drift
-// between the three operations; it is inert on a GET.
+// A URL that arrives inside a provider response is untrusted input even when the provider is
+// trusted, so the fetch is hardened in three independent ways:
+//   - the dial control hook refuses to connect to any address that is not publicly routable,
+//     which also defeats a DNS answer that resolves an allowed host to an internal address;
+//   - the redirect chain is capped, every hop is re-validated, and a hop may not leave the
+//     origin of the URL that was validated first;
+//   - the Authorization header is removed from every redirected request, whatever its target,
+//     which is strictly stronger than Go's own same-domain-or-subdomain rule.
+func newErrorsDocumentHTTPClient(allowedHosts []string) *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   errorsDocumentDialTimeout,
+		KeepAlive: defaultIdleConnTimeout,
+		Control:   controlPubliclyRoutableAddress,
+	}
+	transport := &http.Transport{
+		DialContext:         dialer.DialContext,
+		MaxIdleConns:        defaultMaxConnsPerHost,
+		MaxIdleConnsPerHost: defaultMaxIdleConnsPerHost,
+		IdleConnTimeout:     defaultIdleConnTimeout,
+		// Disable compression to prevent BREACH attacks, and to keep the transferred size
+		// equal to the size the read budget is applied to.
+		DisableCompression: true,
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   errorsDocumentTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// The credential never crosses a redirect, whatever the target is.
+			req.Header.Del("Authorization")
+			if len(via) >= maxErrorsDocumentRedirects {
+				return fmt.Errorf("the errors document redirected more than %d times", maxErrorsDocumentRedirects)
+			}
+			if _, err := validateErrorsURL(req.URL.String(), allowedHosts); err != nil {
+				return fmt.Errorf("the errors document redirect was rejected: %w", err)
+			}
+			if len(via) > 0 && !sameOrigin(req.URL, via[0].URL) {
+				return fmt.Errorf("the errors document redirected off its origin, to host %q", req.URL.Hostname())
+			}
+			return nil
+		},
+	}
+}
+
+// controlPubliclyRoutableAddress refuses any connection to an address that is not publicly
+// routable. It runs after DNS resolution and immediately before the socket is connected, so it
+// sees the address that will actually be dialled - which is what makes it effective against
+// DNS rebinding and against a redirect aimed at a cloud metadata endpoint.
+func controlPubliclyRoutableAddress(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("the dial address %q cannot be parsed: %w", address, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("the dial address %q is not an ip address", host)
+	}
+	if !isPubliclyRoutableIP(ip) {
+		return fmt.Errorf("refusing to connect to the non publicly routable address %s", ip)
+	}
+	return nil
+}
+
+// isPubliclyRoutableIP reports whether ip sits outside every range a server-side request
+// forgery would aim at: loopback, private, link-local (which covers 169.254.169.254),
+// carrier-grade NAT, multicast, unspecified and "this network".
+//
+// The address is unmapped first, so that an IPv4-mapped IPv6 form such as ::ffff:127.0.0.1
+// cannot slip past the IPv4 checks.
+func isPubliclyRoutableIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if unmapped := ip.To4(); unmapped != nil {
+		ip = unmapped
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		switch {
+		case ip4[0] == 0: // 0.0.0.0/8 - "this network".
+			return false
+		case ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127: // 100.64.0.0/10 - carrier-grade NAT.
+			return false
+		case ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 0: // 192.0.0.0/24 - IETF assignments.
+			return false
+		}
+	}
+	return true
+}
+
+// sameOrigin reports whether two URLs share a scheme, a host and an effective port.
+func sameOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	effectivePort := func(u *url.URL) string {
+		if port := u.Port(); port != "" {
+			return port
+		}
+		return "443"
+	}
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		normalizeHost(a.Hostname()) == normalizeHost(b.Hostname()) &&
+		effectivePort(a) == effectivePort(b)
+}
+
+// validateErrorsURL parses and vets a provider-supplied errors document URL before any
+// connection is attempted, and reports whether its host is served by SendGrid itself.
+//
+// The URL is canonicalized first, then everything that could turn the fetch into a request
+// against infrastructure this connector must not reach is rejected: a non-HTTPS scheme, an
+// opaque reference, embedded credentials, a fragment, a missing host, an IP literal, a
+// punycode host, a port other than 443, and any host outside the allow list. Only after all of
+// that does the caller decide whether to attach the credential.
+func validateErrorsURL(rawURL string, allowedHosts []string) (*url.URL, error) {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return nil, errors.New("the errors document url is empty")
+	}
+	if len(trimmed) > maxErrorsURLLength {
+		return nil, fmt.Errorf("the errors document url is longer than %d characters", maxErrorsURLLength)
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return nil, errors.New("the errors document url is not a valid url")
+	}
+	if !strings.EqualFold(parsed.Scheme, "https") {
+		return nil, fmt.Errorf("the errors document url scheme %q is not allowed, https is required", parsed.Scheme)
+	}
+	if parsed.Opaque != "" {
+		return nil, errors.New("the errors document url must not be opaque")
+	}
+	if parsed.User != nil {
+		return nil, errors.New("the errors document url must not carry user information")
+	}
+	if parsed.Fragment != "" || parsed.RawFragment != "" {
+		return nil, errors.New("the errors document url must not carry a fragment")
+	}
+	host := normalizeHost(parsed.Hostname())
+	if host == "" {
+		return nil, errors.New("the errors document url has no host")
+	}
+	if net.ParseIP(host) != nil {
+		return nil, errors.New("the errors document url host must be a domain name, not an ip literal")
+	}
+	if strings.Contains(host, "xn--") {
+		return nil, fmt.Errorf("the errors document url host %q is an internationalised name and is not allowed", host)
+	}
+	if port := parsed.Port(); port != "" && port != "443" {
+		return nil, fmt.Errorf("the errors document url port %q is not allowed, 443 is required", port)
+	}
+	if !hostAllowed(host, allowedHosts) {
+		return nil, fmt.Errorf("the errors document url host %q is not allowed; add it to BatchRouter.%s.%s to allow it",
+			host, destName, configKeyErrorsURLAllowedHosts)
+	}
+	return parsed, nil
+}
+
+// hostAllowed reports whether host equals, or is a subdomain of, one of the allowed entries.
+//
+// Matching on an exact value or on a dot-prefixed suffix is what keeps a lookalike host out:
+// neither "api.sendgrid.com.attacker.example" nor "notsendgrid.com" can match "sendgrid.com".
+func hostAllowed(host string, allowed []string) bool {
+	host = normalizeHost(host)
+	for _, entry := range allowed {
+		entry = strings.TrimPrefix(normalizeHost(entry), ".")
+		if entry == "" {
+			continue
+		}
+		if host == entry || strings.HasSuffix(host, "."+entry) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSendGridHost reports whether host is served by SendGrid itself, which is the only case in
+// which the API key may be attached to an errors document request. A document served from
+// object storage is reached through a pre-signed URL that authenticates through its own query
+// parameters, so it neither needs nor receives the credential.
+func isSendGridHost(host string) bool {
+	return hostAllowed(host, sendGridHostSuffixes)
+}
+
+// normalizeHost lower-cases a host name and strips the optional root label dot, so that
+// "API.SendGrid.com." and "api.sendgrid.com" compare equal.
+func normalizeHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+}
+
+// setAuthorizationHeader attaches the static bearer credential.
+//
+// SendGrid authenticates the v3 Web API with a static key, so there is no token exchange, no
+// refresh and no OAuth subsystem involved. It is a separate function from setRequestHeaders so
+// that the one request whose target is provider-supplied can decide whether to call it at all.
+func setAuthorizationHeader(req *http.Request, apiKey string) {
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+}
+
+// setRequestHeaders applies the headers the two fixed SendGrid endpoints need. Content-Type is
+// strictly required only on the upsert, which is the one call that carries a body, but it is
+// set unconditionally so the header logic lives in one place and cannot drift between the two
+// operations; it is inert on a GET.
 func setRequestHeaders(req *http.Request, apiKey string) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	setAuthorizationHeader(req, apiKey)
 }
 
 // sendGridAPIServiceImpl is the production SendGridAPIService: a thin, stateless HTTP
@@ -134,6 +403,18 @@ type sendGridAPIServiceImpl struct {
 	// statLabels are the tags every measurement is emitted with. They are fixed at
 	// construction because none of them can change over the adapter's lifetime.
 	statLabels stats.Tags
+
+	// errorsClient is a separate, hardened client used ONLY for the errors document, whose
+	// target is supplied by the provider rather than built here. It is not the client above
+	// because the two have genuinely different threat models: the fixed endpoints are
+	// compile-time constants, while this one is remote input.
+	errorsClient *http.Client
+
+	// errorsURLAllowedHosts is the allow list an errors document URL's host must satisfy.
+	errorsURLAllowedHosts []string
+
+	// maxErrorsDocumentBytes bounds how many bytes of the errors document are read.
+	maxErrorsDocumentBytes int64
 }
 
 // Compile-time proof that the adapter really satisfies the seam declared in types.go, so
@@ -173,11 +454,21 @@ func NewSendGridAPIService(destination *backendconfig.DestinationT, log logger.L
 	if statsFactory == nil {
 		statsFactory = stats.NOP
 	}
+	// Both resolve BatchRouter.SENDGRID_BULK_UPLOAD.<key> and fall back to BatchRouter.<key>,
+	// defaulting to SendGrid's own domains and to a generous document budget.
+	allowedHosts := common.GetBatchRouterConfigStringMap(configKeyErrorsURLAllowedHosts, destName, defaultErrorsURLAllowedHosts)
+	maxErrorsDocumentBytes := common.GetBatchRouterConfigInt64(configKeyMaxErrorsDocumentBytes, destName, defaultMaxErrorsDocumentBytes)
+	if maxErrorsDocumentBytes <= 0 {
+		maxErrorsDocumentBytes = defaultMaxErrorsDocumentBytes
+	}
 	return &sendGridAPIServiceImpl{
-		client:       getDefaultHTTPClient(),
-		apiKey:       apiKey,
-		logger:       log,
-		statsFactory: statsFactory,
+		client:                 getDefaultHTTPClient(),
+		apiKey:                 apiKey,
+		logger:                 log,
+		statsFactory:           statsFactory,
+		errorsClient:           newErrorsDocumentHTTPClient(allowedHosts),
+		errorsURLAllowedHosts:  allowedHosts,
+		maxErrorsDocumentBytes: maxErrorsDocumentBytes,
 		statLabels: stats.Tags{
 			"module": "batch_router",
 			// Sourced from the destName constant rather than from the destination
@@ -219,12 +510,17 @@ func (s *sendGridAPIServiceImpl) UploadContacts(request UpsertRequest) (*UpsertR
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("sendgrid %s: reading response body (status %d): %w", opUploadContacts, resp.StatusCode, err)
-	}
+	// The body is read through a budget, and the STATUS is classified from the response
+	// regardless of whether that read succeeded. A failed or oversized body therefore never
+	// masks a 403 or a 429: readLimitedBody yields a nil body on failure, classifyResponse
+	// still sees the real status code, and only a genuine success falls through to the read
+	// error below.
+	body, readErr := readLimitedBody(resp, maxAPIResponseBytes)
 	if err := s.classifyResponse(opUploadContacts, http.StatusAccepted, resp, body); err != nil {
 		return nil, err
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("sendgrid %s: reading response body (status %d): %w", opUploadContacts, resp.StatusCode, readErr)
 	}
 
 	var upsertResp UpsertResponse
@@ -270,12 +566,12 @@ func (s *sendGridAPIServiceImpl) GetImportStatus(jobID string) (*ImportStatusRes
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("sendgrid %s: reading response body (status %d): %w", opGetImportStatus, resp.StatusCode, err)
-	}
+	body, readErr := readLimitedBody(resp, maxAPIResponseBytes)
 	if err := s.classifyResponse(opGetImportStatus, http.StatusOK, resp, body); err != nil {
 		return nil, err
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("sendgrid %s: reading response body (status %d): %w", opGetImportStatus, resp.StatusCode, readErr)
 	}
 
 	var status ImportStatusResponse
@@ -285,8 +581,8 @@ func (s *sendGridAPIServiceImpl) GetImportStatus(jobID string) (*ImportStatusRes
 	return &status, nil
 }
 
-// GetImportErrors performs an authenticated GET of the URL SendGrid published in
-// ImportResults.ErrorsURL and returns that document exactly as received.
+// GetImportErrors fetches the URL SendGrid published in ImportResults.ErrorsURL and returns
+// that document exactly as received.
 //
 // It stays raw on purpose. The document's schema is genuinely undocumented - the official
 // specification mentions errors_url only as a bare string URL, with no media type and no
@@ -294,33 +590,77 @@ func (s *sendGridAPIServiceImpl) GetImportStatus(jobID string) (*ImportStatusRes
 // this transport adapter, which must not encode a guess about a shape it cannot verify.
 // Nothing is unmarshalled here, no content type is sniffed and no decompression is
 // attempted.
+//
+// This is the ONE request in the connector whose target is chosen by the remote side, so it is
+// the one place where the credential must not simply be attached. The URL is validated and
+// canonicalized BEFORE any request is built, and the bearer key is then attached only when the
+// host is served by SendGrid itself - a document served from object storage is reached through
+// a pre-signed URL that authenticates through its own query parameters, so sending the key
+// there would disclose it for no purpose. The request also goes through the hardened
+// errorsClient, which caps and re-validates redirects, strips the credential from every hop and
+// refuses to dial a non-publicly-routable address.
 func (s *sendGridAPIServiceImpl) GetImportErrors(errorsURL string) ([]byte, error) {
-	if errorsURL == "" {
+	if strings.TrimSpace(errorsURL) == "" {
 		return nil, fmt.Errorf("sendgrid %s: errorsURL is empty", opGetImportErrors)
 	}
-	// The URL is supplied by SendGrid rather than built here, and it still requires the
-	// bearer credential, which is why it goes through the same authenticated request path
-	// as the two fixed endpoints.
-	req, err := s.newRequest(opGetImportErrors, http.MethodGet, errorsURL, nil)
+	parsed, err := validateErrorsURL(errorsURL, s.errorsURLAllowedHosts)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("sendgrid %s: %w", opGetImportErrors, err)
 	}
-	resp, err := s.client.Do(req)
+	// The originally supplied string is used verbatim rather than re-serialized, so that a
+	// pre-signed URL's signature can never be invalidated by canonicalization. Validation ran
+	// against the parsed form, so nothing is trusted that was not checked.
+	req, err := http.NewRequest(http.MethodGet, strings.TrimSpace(errorsURL), nil)
+	if err != nil {
+		return nil, fmt.Errorf("sendgrid %s: building request: %w", opGetImportErrors, err)
+	}
+	req.Header.Set("Accept", "application/json")
+	credentialed := isSendGridHost(parsed.Hostname())
+	if credentialed {
+		setAuthorizationHeader(req, s.apiKey)
+	}
+
+	resp, err := s.errorsClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sendgrid %s: %w", opGetImportErrors, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// The read error is propagated rather than discarded: a truncated errors document
-	// handed to the parser as though it were complete would leave the rows lost to the
-	// truncation reported as delivered, which is exactly the silent data loss the whole
-	// reconciliation path exists to prevent.
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("sendgrid %s: reading response body (status %d): %w", opGetImportErrors, resp.StatusCode, err)
-	}
+	// The read is bounded and its failure is propagated rather than discarded: a truncated
+	// errors document handed to the parser as though it were complete would leave the rows lost
+	// to the truncation reported as delivered, which is exactly the silent data loss the whole
+	// reconciliation path exists to prevent. The status is classified from the response either
+	// way, so an oversized body can never mask a 403 or a 429.
+	body, readErr := readLimitedBody(resp, s.maxErrorsDocumentBytes)
 	if err := s.classifyResponse(opGetImportErrors, http.StatusOK, resp, body); err != nil {
 		return nil, err
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("sendgrid %s: reading response body (status %d): %w", opGetImportErrors, resp.StatusCode, readErr)
+	}
+	return body, nil
+}
+
+// readLimitedBody reads at most limit bytes of a response body.
+//
+// An advertised Content-Length above the budget is rejected WITHOUT reading anything, and the
+// read itself goes through a limit reader so that a chunked or mis-advertised body cannot
+// exhaust memory either. One byte beyond the budget is read deliberately, so that overflow can
+// be detected and reported as an error instead of being truncated silently - a truncated
+// document would otherwise be parsed as a shorter, different one.
+func readLimitedBody(resp *http.Response, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		limit = maxAPIResponseBytes
+	}
+	if resp.ContentLength > limit {
+		return nil, fmt.Errorf("the response advertises %d bytes, which exceeds the %d byte limit", resp.ContentLength, limit)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading the response body: %w", err)
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("the response body exceeds the %d byte limit", limit)
 	}
 	return body, nil
 }
