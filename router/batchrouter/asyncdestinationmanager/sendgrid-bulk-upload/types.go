@@ -7,534 +7,241 @@ import (
 	"strings"
 	"time"
 
-	"github.com/samber/lo"
-
 	"github.com/rudderlabs/rudder-go-kit/logger"
 	"github.com/rudderlabs/rudder-go-kit/stats"
 )
 
 const (
-	// destName is the single source of truth for this connector's destination-definition
-	// name, and it must be used verbatim as the "destType" stats tag and as log context
-	// everywhere in this package so that the tag can never drift from the registered name.
+	// destName is the single source of truth for this connector's destination-definition name.
+	// The same literal is registered in three places outside this package - the batch destination
+	// catalogue the processor consults, the async destination list the batch router classifies
+	// against, and the async destination manager factory switch - and all three compare it as a
+	// plain string, so a typo produces neither a compile error nor a test failure: the destination
+	// would simply never be routed. It is therefore never written inline as a stats tag or a log
+	// field; every such site reads this constant.
 	//
-	// The very same literal is registered in three places outside this package - the batch
-	// destination catalog the processor consults, the async destination list the batch
-	// router classifies against, and the async destination manager factory switch - and
-	// every one of them compares it as a plain string. A typo therefore produces neither a
-	// compile error nor a test failure: the destination would simply never be routed
-	// anywhere, which is why the value lives in exactly one place.
-	//
-	// Note that this is deliberately NOT the pre-existing "SENDGRID" cloud destination,
-	// which is a different, synchronously delivered destination handled by the regular
-	// router and is untouched by this connector.
+	// This is deliberately NOT the pre-existing "SENDGRID" cloud destination, which is delivered
+	// synchronously by the regular router and is untouched by this connector.
 	destName = "SENDGRID_BULK_UPLOAD"
 )
 
-// DestinationConfig is the typed view of this connector's destination configuration, as
-// delivered by the control plane in the destination's untyped config map.
-//
-// It is populated by round-tripping that untyped map through jsonrs.Marshal followed by
-// jsonrs.Unmarshal, so it carries plain JSON tags only and needs no custom unmarshaller.
-// The tags are the keys the control plane sends and follow the lowerCamelCase convention
-// used by every other bulk-upload connector in this tree.
+// DestinationConfig is the typed view of this connector's destination configuration as delivered by
+// the control plane. It is populated by round-tripping the untyped config map through
+// jsonrs.Marshal followed by jsonrs.Unmarshal, so plain JSON tags are all it needs.
 type DestinationConfig struct {
-	// APIKey is the SendGrid API key presented as a static bearer credential on every
-	// request. It is mandatory: SendGrid authenticates the Marketing Contacts API with this
-	// key alone, so a destination without it cannot do any useful work and construction of
-	// the manager must fail outright rather than hand back a half-configured uploader that
-	// would only fail later, once per batch, with an opaque 401.
+	// APIKey is the SendGrid API key presented as a static bearer credential on every request. It
+	// is mandatory: a destination without it cannot do useful work, so manager construction fails
+	// outright rather than returning an uploader that would produce an opaque 401 on every batch.
 	APIKey string `json:"apiKey"`
 
-	// ListIDs are the SendGrid Marketing Campaigns list IDs that every contact in an upload
-	// is added to.
-	//
-	// It is optional. An upsert carrying no list IDs still creates or updates the contacts,
-	// it simply does not associate them with any list. It is also the lowest-priority
-	// source of list IDs: a per-event context.externalId entry of type "listIds" takes
-	// precedence over it, so that a single destination can target different lists per event.
+	// ListIDs are the SendGrid Marketing Campaigns lists every contact of an upload is added to.
+	// Optional, and the lowest-priority source of list IDs: a per-event context.externalId entry of
+	// type "listIds" takes precedence, so one destination can target different lists per event.
 	ListIDs []string `json:"listIds"`
 
-	// CustomFieldsMapping maps a RudderStack trait name (the key) onto a SendGrid custom
-	// field ID (the value) - an opaque identifier such as "w1" or "w2".
-	//
-	// The mapping is explicit and operator-supplied because SendGrid requires a custom
-	// field to exist before any value can be written to it and addresses it by ID rather
-	// than by name. Inventing field names would therefore produce nothing but rejected
-	// requests, so a trait with no entry here is not sent as a custom field at all.
-	//
-	// The field is VALIDATED AND NORMALIZED at construction by
-	// validateCustomFieldsMapping, so by the time any uploader reads it every key and every
-	// value is trimmed and non-blank, and no two keys share a value. A mapping that breaks
-	// any of those rules fails NewManager instead of being applied: a blank field ID would
-	// have SendGrid reject every contact in every batch, and two traits claiming one field ID
-	// would resolve by Go's randomized map iteration order, delivering a different value on
-	// each run while looking perfectly healthy. It is optional and may be nil or empty.
+	// CustomFieldsMapping maps a RudderStack trait name (key) onto a SendGrid custom field ID
+	// (value) - an opaque identifier such as "w1". The mapping is explicit and operator-supplied
+	// because SendGrid requires a custom field to exist before a value can be written to it and
+	// addresses it by ID rather than by name, so inventing names would only produce rejected
+	// requests. It is normalized and validated during construction: keys and values are trimmed and
+	// non-blank, and no two traits may claim the same field ID.
 	CustomFieldsMapping map[string]string `json:"customFieldsMapping"`
 }
 
 // Contact is one contact object of the SendGrid Marketing Contacts upsert request body.
 //
-// SendGrid upserts contacts: a field omitted from the request is left exactly as it was on
-// the existing contact, whereas a field sent with an empty value OVERWRITES whatever was
-// stored before. Every field therefore carries omitempty, so that a trait missing from a
-// RudderStack event can never silently erase data already held in SendGrid.
+// SendGrid upserts contacts: a field omitted from the request keeps the value already stored,
+// whereas a field sent empty OVERWRITES it. Every field therefore carries omitempty, so a trait
+// missing from a RudderStack event can never silently erase data held in SendGrid.
 //
-// A contact must carry at least one of Email, PhoneNumberID, ExternalID or AnonymousID;
-// SendGrid rejects a contact that has none of the four. Email is the primary identifier and
-// SendGrid lower-cases it on ingestion, which is precisely what lets an import's errors be
-// reconciled against the jobs that produced it without keeping any state between calls.
+// A contact must carry at least one of Email, PhoneNumberID, ExternalID or AnonymousID. Email is
+// the primary identifier and SendGrid lower-cases it on ingestion, which is what allows an import's
+// errors to be reconciled against the jobs that produced it without keeping any state between
+// calls.
 type Contact struct {
-	// Email is the primary contact identifier. SendGrid lower-cases it automatically, so it
-	// is also lower-cased locally before it is used as a reconciliation key.
-	Email string `json:"email,omitempty"`
-
-	// PhoneNumberID is an alternative unique identifier and must be a valid phone number.
-	PhoneNumberID string `json:"phone_number_id,omitempty"`
-
-	// ExternalID is an alternative unique identifier. RudderStack maps an event's userId
-	// onto it by default.
-	ExternalID string `json:"external_id,omitempty"`
-
-	// AnonymousID is an alternative unique identifier. RudderStack maps an event's
-	// anonymousId onto it.
-	AnonymousID string `json:"anonymous_id,omitempty"`
-
-	// FirstName is a reserved SendGrid contact field.
-	FirstName string `json:"first_name,omitempty"`
-
-	// LastName is a reserved SendGrid contact field.
-	LastName string `json:"last_name,omitempty"`
-
-	// AddressLine1 is a reserved SendGrid contact field.
-	AddressLine1 string `json:"address_line_1,omitempty"`
-
-	// AddressLine2 is a reserved SendGrid contact field.
-	AddressLine2 string `json:"address_line_2,omitempty"`
-
-	// City is a reserved SendGrid contact field.
-	City string `json:"city,omitempty"`
-
-	// StateProvinceRegion is a reserved SendGrid contact field.
-	StateProvinceRegion string `json:"state_province_region,omitempty"`
-
-	// PostalCode is a reserved SendGrid contact field.
-	PostalCode string `json:"postal_code,omitempty"`
-
-	// Country is a reserved SendGrid contact field and accepts either a full country name
-	// or an abbreviation.
-	Country string `json:"country,omitempty"`
-
-	// AlternateEmails holds additional email addresses belonging to the same contact.
-	AlternateEmails []string `json:"alternate_emails,omitempty"`
-
-	// CustomFields holds values for custom fields that already exist in SendGrid, keyed by
-	// their SendGrid custom field ID as resolved through DestinationConfig.CustomFieldsMapping.
-	CustomFields map[string]any `json:"custom_fields,omitempty"`
+	Email               string         `json:"email,omitempty"`
+	PhoneNumberID       string         `json:"phone_number_id,omitempty"`
+	ExternalID          string         `json:"external_id,omitempty"`
+	AnonymousID         string         `json:"anonymous_id,omitempty"`
+	FirstName           string         `json:"first_name,omitempty"`
+	LastName            string         `json:"last_name,omitempty"`
+	AddressLine1        string         `json:"address_line_1,omitempty"`
+	AddressLine2        string         `json:"address_line_2,omitempty"`
+	City                string         `json:"city,omitempty"`
+	StateProvinceRegion string         `json:"state_province_region,omitempty"`
+	PostalCode          string         `json:"postal_code,omitempty"`
+	Country             string         `json:"country,omitempty"`
+	AlternateEmails     []string       `json:"alternate_emails,omitempty"`
+	CustomFields        map[string]any `json:"custom_fields,omitempty"`
 }
 
-// UpsertRequest is the body of the SendGrid Marketing Contacts upsert call.
-//
-// The endpoint accepts at most 30,000 contacts or 6MB of data per request, whichever limit
-// is reached first, so a caller must chunk its contacts against both caps - and must budget
-// the byte cap against the whole serialized body, envelope and list IDs included, not just
-// against the contacts.
+// UpsertRequest is the body of PUT /v3/marketing/contacts. The endpoint accepts at most 30,000
+// contacts or 6 MB per request, whichever is reached first, and the byte cap applies to this whole
+// serialized body - the list IDs and the envelope included - not just to the contacts.
 type UpsertRequest struct {
-	// ListIDs is optional: when it is empty the contacts are upserted without being added
-	// to any list, so the key is omitted from the body entirely rather than being sent as
-	// null or as an empty array.
-	ListIDs []string `json:"list_ids,omitempty"`
-
-	// Contacts is required and is always serialized, even when the slice is empty, because
-	// the endpoint expects the key to be present.
+	ListIDs  []string  `json:"list_ids,omitempty"`
 	Contacts []Contact `json:"contacts"`
 }
 
-// UpsertResponse is the body SendGrid returns with HTTP 202 Accepted once it has queued an
-// upsert for asynchronous processing. A 202 means "accepted for processing", never
-// "applied", which is why the connector polls.
+// UpsertResponse is the 202 Accepted body of the upsert call. The job ID it carries is the handle
+// for every later status and error lookup, and it is persisted verbatim so that Poll receives
+// exactly the string SendGrid issued.
 type UpsertResponse struct {
-	// JobID identifies the queued import. It is the value that has to be persisted in the
-	// batch router's importing parameters and later handed back to
-	// SendGridAPIService.GetImportStatus.
 	JobID string `json:"job_id"`
 }
 
-// ImportStatusResponse is the body of the SendGrid import status call, which is addressed
-// with the job_id returned by the upsert.
+// ImportStatusResponse is the body of GET /v3/marketing/contacts/imports/{id}.
 //
-// Status is one of exactly four documented values:
-//
-//	pending   - the import has not finished; this is the only non-terminal state
-//	completed - the import finished without any errors
-//	errored   - the import finished with some errors, described by Results.ErrorsURL
-//	failed    - the import finished with all errors, or was entirely unprocessable
-//
-// There is no "processing" or "in_progress" value, and "completed" carries the promise that
-// nothing errored - SendGrid signals a partial failure with "errored".
+// The counts and the errors document URL live inside a NESTED results object. A flat struct would
+// compile and unmarshal without error while reading errored_count as 0 forever, which would report
+// every partial failure as a clean success - the single highest-risk detail in this connector.
 type ImportStatusResponse struct {
-	// ID echoes the import's job_id.
-	ID string `json:"id"`
-
-	// Status is the import state; see the four documented values above.
-	Status string `json:"status"`
-
-	// JobType describes the kind of import SendGrid ran, for example an upsert.
-	JobType string `json:"job_type"`
-
-	// Results MUST stay nested. SendGrid reports the per-row counters and the errors
-	// document URL inside a "results" object, never at the top level. A flattened struct
-	// would still unmarshal without any error and would then read ErroredCount as 0
-	// forever, so every partially failed import would be reported as a clean success and
-	// the failing rows would be marked delivered. That makes this nesting the single
-	// highest-risk detail of the whole connector.
-	Results ImportResults `json:"results"`
-
-	// StartedAt is when SendGrid began the import. It is kept as an opaque string on
-	// purpose: nothing in this connector reasons about the instant, so parsing it would add
-	// a failure mode and buy nothing.
-	StartedAt string `json:"started_at"`
-
-	// FinishedAt is when SendGrid finished the import, kept as an opaque string for the
-	// same reason as StartedAt.
-	FinishedAt string `json:"finished_at"`
+	ID         string        `json:"id"`
+	Status     string        `json:"status"`
+	JobType    string        `json:"job_type"`
+	Results    ImportResults `json:"results"` // MUST stay nested
+	StartedAt  string        `json:"started_at"`
+	FinishedAt string        `json:"finished_at"`
 }
 
-// ImportResults is the nested "results" object of an import status response. It is a
-// distinct type rather than an inline struct so that tests and the poll mapping can build
-// and assert on it directly.
+// ImportResults is the nested results object of an import status response.
 type ImportResults struct {
-	// RequestedCount is how many contacts the upsert asked SendGrid to process.
-	RequestedCount int `json:"requested_count"`
-
-	// CreatedCount is how many contacts SendGrid created.
-	CreatedCount int `json:"created_count"`
-
-	// UpdatedCount is how many existing contacts SendGrid updated.
-	UpdatedCount int `json:"updated_count"`
-
-	// DeletedCount is how many contacts SendGrid deleted, which stays zero for an upsert.
-	DeletedCount int `json:"deleted_count"`
-
-	// ErroredCount is how many rows SendGrid could not process. Any value above zero means
-	// the import must be reconciled row by row through the errors document, no matter which
-	// status the import reports.
-	ErroredCount int `json:"errored_count"`
-
-	// ErrorsURL is an authenticated URL serving a document that describes the errored rows.
-	// It is empty when nothing errored.
-	ErrorsURL string `json:"errors_url"`
+	RequestedCount int    `json:"requested_count"`
+	CreatedCount   int    `json:"created_count"`
+	UpdatedCount   int    `json:"updated_count"`
+	DeletedCount   int    `json:"deleted_count"`
+	ErroredCount   int    `json:"errored_count"`
+	ErrorsURL      string `json:"errors_url"`
 }
 
-// ImportErrorRow is one row of the document SendGrid publishes at ImportResults.ErrorsURL,
-// reduced to the only two things reconciliation actually needs.
+// ImportErrorRow is one row of the document published at ImportResults.ErrorsURL, reduced to the
+// only two things reconciliation needs.
 //
-// The model is deliberately loose - two plain strings and no JSON tags - because that
-// document's schema is genuinely undocumented. The official specification mentions
-// errors_url exactly twice and both times only as a bare string URL, with no media type,
-// no schema and no stated retention, and the reference pages describe no format at all.
-// Committing a rigid shape here would turn any difference between the guess and reality
-// into silent data loss, because a row that fails to match leaves a job that really failed
-// reported as delivered.
-//
-// The tolerant parser in the manager therefore decodes the document generically and fills
-// these fields from whichever candidate key each row actually carries: message,
-// error_message, reason or detail for Message, and email, contact.email, identifier,
-// external_id or anonymous_id for Identifier.
+// The model is deliberately loose and carries no JSON tags: that document's schema is genuinely
+// undocumented - the provider's OpenAPI specification mentions errors_url twice, both times as a
+// bare string URL with no media type and no schema - so the tolerant parser fills these fields in
+// from whichever candidate key a row happens to use rather than binding to one guessed shape.
 type ImportErrorRow struct {
-	// Identifier is the contact identifier the row refers to, normally the email address.
-	// It is compared case-insensitively against the identifiers re-derived from the
-	// importing jobs, so that a row can be resolved back to the job that produced it
-	// without any state having been carried over from the upload.
+	// Identifier is the contact identifier the row refers to, used to resolve the row back to the
+	// job that produced the contact. It never leaves reconciliation: it is not logged and not
+	// written into any persisted failure reason, because it is contact PII.
 	Identifier string
 
-	// Message is the human-readable reason SendGrid could not process the row. It becomes
-	// the recorded failure reason of the job the row resolves to.
+	// Message is the provider's own description of the rejection. It is used ONLY to derive a
+	// connector-owned error class; it is never logged and never persisted, because provider prose
+	// can restate any contact field it likes.
 	Message string
 }
 
-// APIErrorItem is one entry of the standard SendGrid error envelope.
+// APIErrorItem is one entry of the documented SendGrid error body,
+// {"errors":[{"field":null,"message":"…"}]}.
+//
+// Field is a pointer because the documented 429 body sends field: null, which a plain string cannot
+// represent. Message is decoded to model the documented body faithfully and to let the connector
+// count the items an error response carried; it is deliberately never rendered into an error string,
+// a log line or a persisted failure reason, because provider prose is untrusted third-party text
+// that may echo contact data.
 type APIErrorItem struct {
-	// Field names the request field the error refers to.
-	//
-	// It is a pointer because SendGrid legitimately sends a null field for errors that are
-	// not tied to any particular field - the documented rate-limit body is exactly
-	// {"errors":[{"field":null,"message":"too many requests"}]} - and a plain string could
-	// not tell that null apart from an empty field name.
-	Field *string `json:"field"`
-
-	// Message is the human-readable reason SendGrid rejected the request.
-	Message string `json:"message"`
+	Field   *string `json:"field"`
+	Message string  `json:"message"`
 }
 
-// String renders one error entry, tolerating the null field described on Field.
-func (i APIErrorItem) String() string {
-	if i.Field == nil {
-		return i.Message
-	}
-	return "field=" + *i.Field + ": " + i.Message
-}
-
-// APIErrorResponse is the wire shape of a SendGrid error body, which wraps one or more
-// entries under an "errors" key. It is decoded on a best-effort basis: a response that is
-// not a SendGrid error envelope at all, such as an HTML page returned by an edge proxy,
-// simply yields no entries and is reported through APIError.Message instead.
-type APIErrorResponse struct {
-	// Errors holds the individual error entries SendGrid reported.
-	Errors []APIErrorItem `json:"errors"`
-}
-
-// APIError is the error a SendGridAPIService implementation returns for any SendGrid
-// response that is not a success, other than a rate limit - which is reported as the more
-// specific *RateLimitError so that callers can treat it as retryable.
+// APIError reports a SendGrid response this connector cannot use.
 //
-// It is returned as a pointer, so a caller can recover the concrete value with
-// errors.As and branch on the status code rather than on the message text.
+// Everything it renders is connector-owned: the operation that failed, the HTTP status code, and how
+// many error items the documented body carried. That is enough for an operator to act on and safe to
+// place in a JobsDB failure reason, which is where these strings ultimately land.
 type APIError struct {
-	// StatusCode is the HTTP status code SendGrid answered with. It is carried explicitly
-	// so that a caller can map the outcome onto the batch router's retryable or terminal
-	// channel without re-parsing anything.
-	StatusCode int
-
-	// Operation names the SendGrid call that failed, for example "upload contacts", so a
-	// single reason string tells an operator both what failed and why.
+	// Operation names the SendGrid call, using this package's own vocabulary.
 	Operation string
-
-	// Message carries a summary of the failure. It is used on its own whenever the response
-	// body was absent, empty or not a SendGrid error envelope, so that an operator is never
-	// left holding nothing but a bare status code.
-	Message string
-
-	// Errors holds the decoded envelope entries, when the body contained any.
-	Errors []APIErrorItem
-}
-
-// Error implements error. It is defined on the pointer receiver so that the concrete type
-// survives being wrapped and can be recovered with errors.As.
-func (e *APIError) Error() string {
-	if e == nil {
-		return ""
-	}
-	operation := e.Operation
-	if operation == "" {
-		operation = "request"
-	}
-	parts := []string{fmt.Sprintf("sendgrid %s failed with status %d", operation, e.StatusCode)}
-	if e.Message != "" {
-		parts = append(parts, e.Message)
-	}
-	if len(e.Errors) > 0 {
-		parts = append(parts, strings.Join(lo.Map(e.Errors, func(item APIErrorItem, _ int) string {
-			return item.String()
-		}), "; "))
-	}
-	return strings.Join(parts, ": ")
-}
-
-// RateLimitError is the typed error a SendGridAPIService implementation returns when
-// SendGrid answers with HTTP 429.
-//
-// It exists so that a caller can tell a rate limit apart from every other failure with
-// errors.As and route the affected jobs to the batch router's RETRYABLE channel rather
-// than its terminal one. A rate limit is never a permanent condition: the batch router
-// already owns retry, backoff and the decision to give up, so this connector must never
-// abort a job because of a 429, and it deliberately installs no client-side limiter of its
-// own either - SendGrid publishes no per-endpoint figure for the Marketing Contacts
-// endpoints, so any pre-emptive throttle would be a guess. The connector is reactive to
-// 429 instead, which is exactly what this type makes possible.
-//
-// Error renders the advertised reset window and is intentionally deterministic: it never
-// reads the wall clock, so its output can be embedded verbatim in an upload's failure
-// reason and asserted on in tests.
-type RateLimitError struct {
-	// StatusCode is the HTTP status SendGrid answered with, which is 429 for a rate limit.
-	// It is carried explicitly so that callers branch on the value and not on the type
-	// alone, exactly as they do for APIError.
+	// StatusCode is the HTTP status the response carried.
 	StatusCode int
+	// Items are the decoded entries of the documented error body, retained for their count and for
+	// shape fidelity only.
+	Items []APIErrorItem
+}
 
-	// RetryAfter is the raw Retry-After header value, or the empty string when the header is
-	// absent - which is the normal case.
-	//
-	// Retry-After is NOT documented anywhere for the SendGrid v3 Web API, so it must always
-	// be treated as optional. It is still read first when present, because an edge or proxy
-	// in front of the API may inject it and it is then the most direct statement of how long
-	// to wait. It is kept raw because the header may hold either a delay in seconds or an
-	// HTTP date, and normalizing it would discard information for no benefit.
+func (e *APIError) Error() string {
+	return fmt.Sprintf("sendgrid %s responded with status %d carrying %d error item(s)",
+		e.Operation, e.StatusCode, len(e.Items))
+}
+
+// RateLimitError reports an HTTP 429 from any SendGrid call.
+//
+// It exists as a distinct type so that callers detect a rate limit with errors.As instead of
+// re-sniffing status codes, which is what keeps rate-limited jobs on the retryable channel and out
+// of the terminal one. Everything it renders is connector-owned and numeric, so it is safe to
+// persist as a failure reason.
+type RateLimitError struct {
+	// StatusCode is the status that produced this error, always 429.
+	StatusCode int
+	// RetryAfter is the Retry-After hint, normalized to a canonical duration such as "30s", or
+	// empty. The header is not documented for the SendGrid v3 API - it may be injected by an edge or
+	// a proxy - so it is optional, and a value that is neither delta-seconds nor an HTTP date is
+	// discarded rather than carried through as free-form provider text.
 	RetryAfter string
-
-	// ResetAt is the parsed X-RateLimit-Reset header: a UNIX timestamp in SECONDS at which
-	// the current rate-limit window resets.
-	//
-	// It is an absolute instant, NOT a delay - reading it as a duration would produce a wait
-	// of decades - and it is zero when the header was absent or could not be parsed.
-	ResetAt int64
-
-	// Limit mirrors the X-RateLimit-Limit header: how many requests the window allows. It is
-	// zero when the header was absent or unparseable.
-	Limit int
-
-	// Remaining mirrors the X-RateLimit-Remaining header: how many requests are left in the
-	// window. It is zero when the header was absent or unparseable, and SendGrid reports no
-	// remaining quota on a 429 in any case, so zero is safely read as exhausted or unknown.
-	Remaining int
-
-	// Message carries whatever detail SendGrid supplied in the response body, typically
-	// "too many requests".
-	Message string
+	// ResetEpoch is X-RateLimit-Reset, which the provider documents as a UNIX epoch-SECONDS
+	// timestamp rather than a delta. Zero when the header is absent or unparseable.
+	ResetEpoch int64
+	// Limit is X-RateLimit-Limit, or -1 when the header is absent or unparseable.
+	Limit int64
+	// Remaining is X-RateLimit-Remaining, or -1 when the header is absent or unparseable.
+	Remaining int64
 }
 
-// Error implements error, rendering the rate-limit window in a form an operator can act on.
-//
-// It is defined on the pointer receiver so that the concrete type survives being wrapped
-// and can be recovered with errors.As, and it is safe on a zero value: an absent
-// Retry-After, an absent or unparseable reset timestamp and absent limit headers are each
-// reported as such instead of being rendered as a misleading zero.
 func (e *RateLimitError) Error() string {
-	if e == nil {
-		return ""
-	}
-	parts := []string{fmt.Sprintf("sendgrid rate limited the request with status %d", e.StatusCode)}
-	if e.Message != "" {
-		parts = append(parts, e.Message)
-	}
+	details := make([]string, 0, 4)
 	if e.RetryAfter != "" {
-		parts = append(parts, "Retry-After: "+e.RetryAfter)
+		details = append(details, "retryAfter="+e.RetryAfter)
 	}
-	if e.ResetAt > 0 {
-		// Rendered as an absolute UTC instant rather than as a remaining duration, so the
-		// message stays deterministic for a given error value.
-		parts = append(parts, "rate limit window resets at "+time.Unix(e.ResetAt, 0).UTC().Format(time.RFC3339))
+	if e.ResetEpoch > 0 {
+		// Rendered as an absolute UTC instant: the header is epoch seconds, not a delta, and an
+		// absolute timestamp stays meaningful however long the reason survives in JobsDB.
+		details = append(details, "reset="+time.Unix(e.ResetEpoch, 0).UTC().Format(time.RFC3339))
 	}
-	if e.RetryAfter == "" && e.ResetAt <= 0 {
-		parts = append(parts, "no reset window was advertised by sendgrid")
+	if e.Limit >= 0 {
+		details = append(details, fmt.Sprintf("limit=%d", e.Limit))
 	}
-	if e.Limit > 0 || e.Remaining > 0 {
-		parts = append(parts, fmt.Sprintf("X-RateLimit-Limit: %d, X-RateLimit-Remaining: %d", e.Limit, e.Remaining))
+	if e.Remaining >= 0 {
+		details = append(details, fmt.Sprintf("remaining=%d", e.Remaining))
 	}
-	return strings.Join(parts, ", ")
+	if len(details) == 0 {
+		return fmt.Sprintf("sendgrid rate limited the request with status %d and published no rate limit window", e.StatusCode)
+	}
+	return fmt.Sprintf("sendgrid rate limited the request with status %d (%s)",
+		e.StatusCode, strings.Join(details, ", "))
 }
 
-// SendGridAPIService is the seam between this connector and the three SendGrid REST
-// operations it needs: upserting a batch of contacts, reading an import's status, and
-// fetching an import's errors document. There is exactly one method per operation and no
-// other outbound integration exists, which is what lets every test scenario be expressed
-// through mock expectations with no network access whatsoever.
+// SendGridAPIService is the mockable seam over the three - and only three - SendGrid REST
+// operations this connector performs. Every test scenario is expressible through expectations on
+// these methods, so the suite needs no network access at all.
 //
-// Implementations must never return a nil value together with a nil error: every method
-// either yields a usable result or a non-nil error, so callers may branch on the error
-// alone. A failure that describes a SendGrid response should be reported as *APIError, and
-// a 429 must be reported as *RateLimitError so that the caller can detect it with
-// errors.As and keep the affected jobs retryable.
+// None of the pointer-returning methods ever returns a nil value with a nil error.
 type SendGridAPIService interface {
-	// UploadContacts issues the Marketing Contacts upsert and returns the job_id SendGrid
-	// assigned to the queued import. Only HTTP 202 counts as success; every other status is
-	// an error, and 429 specifically is a *RateLimitError.
+	// UploadContacts issues PUT /v3/marketing/contacts and treats only 202 Accepted as success.
 	UploadContacts(request UpsertRequest) (*UpsertResponse, error)
-
-	// GetImportStatus reads the status of a queued import, passing the job_id returned by
-	// UploadContacts as the path parameter the API names id.
+	// GetImportStatus issues GET /v3/marketing/contacts/imports/{id} for one import job ID.
 	GetImportStatus(jobID string) (*ImportStatusResponse, error)
-
-	// GetImportErrors performs an authenticated GET of the URL SendGrid published in
-	// ImportResults.ErrorsURL and returns the document unmodified.
-	//
-	// It stays raw on purpose. The document's schema is undocumented, so interpreting it
-	// belongs to the tolerant parser in the manager rather than to the transport adapter,
-	// which must not encode a guess about a shape it cannot verify.
+	// GetImportErrors fetches the document an import published at results.errors_url and returns it
+	// verbatim, because its schema is undocumented and the adapter must not encode a guess about it.
 	GetImportErrors(errorsURL string) ([]byte, error)
 }
 
-// SendGridBulkUploader is this connector's async destination manager, registered under the
-// destName destination-definition name: it transforms events into SendGrid contacts, upserts
-// them in capped batches, polls the resulting import and reconciles its per-row errors back
-// onto the originating jobs.
+// SendGridBulkUploader is this connector's implementation of the four-method async destination
+// manager contract.
 //
-// Every field is exported for two concrete reasons. The package's tests live in an external
-// test package and build the uploader as a literal, and the four bounds below have to be
-// overrideable per instance so that each can be exercised at its boundary without
-// materializing the production-sized input it would otherwise take:
-//
-//   - MaxContactsPerRequest and MaxRequestBytes are the two request caps. Shrinking them is
-//     what lets the chunker's element and byte boundaries be pinned without building tens of
-//     thousands of contacts or a six-megabyte staging file.
-//   - MaxBufferCapacity is the staging-file line limit. Shrinking it is the only way to
-//     exercise a line the scanner cannot read, which is a distinct failure from a contact the
-//     chunker refuses and has to be provable as such.
-//   - MaxImportsPerUpload is the poll budget an upload spends. Shrinking it is what lets the
-//     deferral of surplus chunks be observed in a few requests rather than in hundreds.
-//
-// Each is a plain int whose zero value selects the production default, so a literal that sets
-// none of them behaves exactly as the constructor-built manager does. Every one of them is
-// resolved through an accessor that validates and clamps it, so an override - or a configured
-// value - outside the supported range cannot reach the code that spends it.
-//
-// The struct deliberately holds NO per-upload or cross-invocation state. Upload statistics
-// may be reconciled in a different process invocation, or on a different pod, from the
-// upload that produced the import, so anything cached at upload time would simply be
-// missing when reconciliation needs it - and a connector that depended on it would report
-// failed rows as delivered after a restart. Reconciliation instead re-derives everything it
-// needs from the importing jobs it is handed. Staying stateless also keeps the package
-// correct under the repository's shuffled test execution.
+// Its fields are exported because the test suite lives in an external package and assembles the
+// uploader directly to inject the generated API-service mock. It holds no per-upload or
+// cross-invocation mutable state: reconciliation re-derives everything it needs from the importing
+// jobs, so GetUploadStats stays correct when it runs in a different process or on a different pod
+// from Upload.
 type SendGridBulkUploader struct {
-	// Logger is the logger for this destination. Only the non-sugared, type-specific field
-	// API may be used with it.
-	Logger logger.Logger
-
-	// StatsFactory builds this connector's counters. Every stat must be tagged with
-	// {module: batch_router, destType: destName, destID: DestinationID}.
-	StatsFactory stats.Stats
-
-	// DestinationID is the destination's backend-config ID. It is both the destID stats tag
-	// and the destination ID that every upload outcome has to carry back to the batch
-	// router, which keys its bookkeeping on it.
-	DestinationID string
-
-	// DestinationConfig is the parsed destination configuration: the API key, the target
-	// list IDs and the trait-to-custom-field mapping.
-	//
-	// It is the single source of truth for every configured value, including the bearer
-	// credential: the HTTP adapter is constructed FROM this parsed view rather than re-reading
-	// the untyped configuration map, so the two readings cannot disagree.
-	//
-	// The destination's human-readable name is deliberately NOT kept here or on this struct. The
-	// destType stats tag and every log line identify this connector through the destName
-	// constant, so that they can never drift from the registered destination-definition name even
-	// if an operator renames the destination, and an operator-facing name that nothing reads
-	// would be dead state.
-	DestinationConfig DestinationConfig
-
-	// SendGridAPIService performs the three SendGrid calls. It is held as the interface
-	// rather than as the concrete adapter so that tests can substitute the generated mock
-	// and exercise every response, including a rate limit, without touching the network.
+	Logger             logger.Logger
+	StatsFactory       stats.Stats
+	DestinationID      string
+	DestinationConfig  DestinationConfig
 	SendGridAPIService SendGridAPIService
 
-	// MaxContactsPerRequest caps how many contacts one upsert may carry, mirroring the
-	// endpoint's documented ceiling of 30,000.
 	MaxContactsPerRequest int // Override for testing (0 = use default)
-
-	// MaxRequestBytes caps the serialized size of one upsert body IN FULL: the
-	// {"list_ids":[...],"contacts":[...]} envelope, every list ID inside it, every contact
-	// and every separating comma, all charged against the endpoint's documented 6MB ceiling.
-	//
-	// The envelope's exact cost is measured per request and deducted from this budget before
-	// any contact is packed, so nothing is reserved for by guesswork and nothing is charged
-	// twice.
-	MaxRequestBytes int // Override for testing (0 = use default)
-
-	// MaxBufferCapacity caps how large a single staging-file line may be.
-	//
-	// Its default is DERIVED from MaxRequestBytes rather than picked, because a limit below the
-	// request budget would fail a whole batch on a record the chunker could otherwise have
-	// rejected on its own. An unusable value - zero or negative - is normalized to that default
-	// rather than reaching bufio.Scanner, where it would make every line unreadable.
-	MaxBufferCapacity int // Override for testing (0 = use default)
-
-	// MaxImportsPerUpload caps how many SendGrid imports one upload may create, and therefore the
-	// worst-case number of status requests each later poll of that upload can cost.
-	//
-	// It is a POLL budget set at upload time, because Poll cannot bound its own work: it persists
-	// no cursor, so it could not resume where a previous poll stopped. Chunks beyond the cap are
-	// not sent and their jobs are reported as retryable, so an oversized batch drains over
-	// consecutive batches instead of issuing an unbounded number of requests.
-	MaxImportsPerUpload int // Override for testing (0 = use default)
+	MaxRequestBytes       int // Override for testing (0 = use default)
 }
