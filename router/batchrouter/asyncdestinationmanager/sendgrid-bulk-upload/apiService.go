@@ -7,12 +7,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/rudderlabs/rudder-go-kit/jsonrs"
 	"github.com/rudderlabs/rudder-go-kit/logger"
@@ -70,12 +72,6 @@ const (
 	opGetImportStatus = "get import status"
 	opGetImportErrors = "get import errors"
 )
-
-// maxResponseBodyExcerptRunes bounds how much of an unexpected response body is quoted into
-// an error or a log line. A SendGrid error envelope is tiny, but an edge proxy can answer
-// with a full HTML page, and that must not be allowed to bloat a job's recorded failure
-// reason in the jobs database.
-const maxResponseBodyExcerptRunes = 512
 
 // Tuned transport settings, matching the convention already established for the
 // bulk-upload connectors in this tree.
@@ -147,20 +143,51 @@ const (
 // redactedCredential replaces any credential recognized in provider-supplied text.
 const redactedCredential = "<redacted-credential>"
 
-// bearerCredentialPattern and sendGridAPIKeyPattern recognize a credential inside text this
-// connector did not write.
+// Placeholders substituted into provider-supplied text for the parts of a URL that must never
+// be kept. None of them contains a quote, a backslash or whitespace, so substituting them
+// leaves a JSON body well-formed and cannot break up a structured log line.
+const (
+	// redactedURLQuery replaces a URL's query string and fragment. An errors document can be
+	// served from object storage through a PRE-SIGNED URL whose query string IS the
+	// credential, so the query has to go even though the origin and path are worth keeping.
+	redactedURLQuery = "<redacted-query>"
+
+	// redactedURLPlaceholder replaces a URL-shaped token that cannot be parsed, so that
+	// something unparseable is never passed through on the assumption it holds no secret.
+	redactedURLPlaceholder = "<redacted-url>"
+
+	// redactedEmail replaces an email address, which is the contact identifier this connector
+	// works with and therefore the personal datum most likely to appear in provider text.
+	redactedEmail = "<redacted-email>"
+
+	// redactedNumber replaces a long run of digits, which is what a phone number or a numeric
+	// account identifier looks like once it is embedded in a sentence.
+	redactedNumber = "<redacted-number>"
+)
+
+// maxRetryAfterRunes bounds how much of a Retry-After header is even considered before it is
+// validated, so that a hostile header cannot drive the parsing work or the resulting text.
+const maxRetryAfterRunes = 64
+
+// urlPattern recognizes an http or https URL inside text this connector did not write.
 //
-// This connector never logs its own key. A provider or an intermediary can nonetheless echo the
-// Authorization header back inside its own response body - a debugging proxy is the usual
-// culprit - and that body is quoted into the error this adapter returns, which becomes a job's
-// recorded failure reason and a log field. Belt and braces: the credential is stripped out of
-// such text before it can be kept anywhere.
+// The character class deliberately stops at whitespace, quotes, angle brackets and backslashes,
+// which is what keeps the match to the URL itself when it appears inside a JSON string, an HTML
+// page or a sentence.
+var urlPattern = regexp.MustCompile(`(?i)\bhttps?://[^\s"'<>\\` + "`" + `]+`)
+
+// trailingURLPunctuation are the characters commonly found immediately after a URL in prose,
+// which urlPattern would otherwise swallow into the reference it builds.
+const trailingURLPunctuation = ".,;:!?)]}>"
+
+// bearerCredentialPattern and sendGridAPIKeyPattern recognize a credential echoed back inside
+// provider-supplied text. Such text is quoted into the errors this adapter returns, so it reaches
+// a job's recorded failure reason and the logs unless the credential is redacted out of it first.
 //
-// bearerCredentialPattern deliberately stops at the first character that cannot appear in a
-// token, so it never swallows the JSON punctuation around the value it redacts, and the
-// replacement keeps the scheme so the diagnostic ("something sent an Authorization header back")
-// survives. sendGridAPIKeyPattern covers a key echoed WITHOUT the scheme, since SendGrid keys
-// have a recognizable SG.<id>.<secret> shape.
+// bearerCredentialPattern matches a credential echoed with its scheme and stops at the first
+// character a token cannot contain, leaving the surrounding JSON punctuation intact.
+// sendGridAPIKeyPattern matches a key echoed without its scheme, which SendGrid's SG.<id>.<secret>
+// shape makes recognizable.
 var (
 	bearerCredentialPattern = regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=\-]+`)
 	sendGridAPIKeyPattern   = regexp.MustCompile(`SG\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}`)
@@ -185,12 +212,184 @@ func redactCredentials(text, apiKey string) string {
 	return redacted
 }
 
+// redactedURLReference renders one URL as a reference that is safe to log or to persist: its
+// scheme, host and path only, with any userinfo, query string and fragment removed.
+//
+// The origin and the path are kept because they are what an operator needs in order to tell an
+// errors document served by SendGrid apart from one served from object storage, and to recognize
+// a host that has to be added to the allow list. Everything else goes, because a pre-signed
+// object-storage URL authenticates through its QUERY STRING - the query is therefore a bearer
+// credential in all but name, and userinfo is one outright.
+//
+// A token that cannot be parsed, or that carries no host, is replaced wholesale rather than
+// passed through: something this function cannot understand is exactly the thing that must not
+// be assumed harmless.
+func redactedURLReference(rawURL string) string {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" {
+		return redactedURLPlaceholder
+	}
+	// Rebuilt from the three safe components rather than mutated in place, so that a component
+	// added to net/url in a future release cannot be carried through by accident.
+	reference := (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: parsed.Path}).String()
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" {
+		// The elision is made visible rather than silent, so that a reader can tell a URL that
+		// never had a query from one whose query was removed.
+		reference += "?" + redactedURLQuery
+	}
+	return reference
+}
+
+// redactURLReferences rewrites every URL found in text as a redactedURLReference.
+//
+// It exists because a URL reaches this connector's diagnostics through paths that cannot all be
+// enumerated: a provider error message, a transport error that quotes the request URL, an HTML
+// error page. Rewriting them wherever they appear is what makes "a pre-signed URL never reaches
+// a log or a job status" a property of the text rather than a property of each call site.
+func redactURLReferences(text string) string {
+	if text == "" {
+		return ""
+	}
+	return urlPattern.ReplaceAllStringFunc(text, func(match string) string {
+		// Punctuation that merely follows the URL in prose is put back afterwards, so the
+		// sentence still reads correctly and the reference itself stays exact.
+		trailing := ""
+		for len(match) > 0 && strings.ContainsRune(trailingURLPunctuation, rune(match[len(match)-1])) {
+			trailing = match[len(match)-1:] + trailing
+			match = match[:len(match)-1]
+		}
+		return redactedURLReference(match) + trailing
+	})
+}
+
+// sanitizeProviderText is the SINGLE gate every piece of remotely supplied text passes through
+// before it reaches somewhere it is kept: an error message, a log field, or a job status
+// persisted in the jobs database.
+//
+// Centralising it is the point. Sanitizing at each call site means the next call site added is
+// the one that leaks, and the text this connector has to record is entirely outside its control:
+// a provider or an intermediary can echo the Authorization header back inside a response body, an
+// errors document can quote the rejected contact's own email address or phone number, an
+// object-storage URL can carry a signature that is a credential, and any of it can carry control
+// characters or run to megabytes.
+//
+// The steps run in this order, and the order is itself a security property:
+//
+//  1. NORMALIZE FIRST - drop control and non-printable characters and collapse whitespace runs
+//     to single spaces. This has to precede the redactions, not follow them. A control
+//     character embedded inside a sensitive value - "alice\x00@example.com", or an
+//     Authorization header split across an escape sequence - defeats every pattern below while
+//     it is still present, and stripping it AFTERWARDS would reassemble the value in the
+//     output, redacting nothing. Note that a dropped character joins the text around it
+//     rather than becoming a space, which is precisely what makes that reassembly happen
+//     BEFORE the patterns run instead of after.
+//  2. credentials, by exact match on the key when the caller holds it and by pattern otherwise;
+//  3. URL userinfo, query strings and fragments;
+//  4. personally identifiable shapes - email addresses and long digit runs;
+//  5. a rune-boundary length cap LAST, so that capping can never truncate a value the earlier
+//     steps were about to redact, and the result is always valid UTF-8.
+//
+// apiKey is optional: callers that hold the credential pass it so it can be matched exactly,
+// and callers that do not still get every pattern-based protection.
+func sanitizeProviderText(text, apiKey string) string {
+	if text == "" {
+		return ""
+	}
+	sanitized := normalizeProviderText(text)
+	sanitized = redactCredentials(sanitized, apiKey)
+	sanitized = redactURLReferences(sanitized)
+	sanitized = emailPattern.ReplaceAllString(sanitized, redactedEmail)
+	sanitized = longNumberPattern.ReplaceAllString(sanitized, redactedNumber)
+	return capRunes(sanitized, maxReasonRunes)
+}
+
+// normalizeProviderText drops control and non-printable characters, collapses every run of
+// whitespace to a single space, and trims the result.
+//
+// A control character is DROPPED rather than replaced with a space. That is deliberate: it is
+// what allows a value split by such a character to be rejoined before the redaction patterns
+// run, so an embedded NUL or escape sequence cannot be used to smuggle an email address or a
+// credential past them. It also means the text can never break up a structured log line.
+func normalizeProviderText(text string) string {
+	var builder strings.Builder
+	builder.Grow(len(text))
+	pendingSpace := false
+	for _, character := range text {
+		switch {
+		case unicode.IsSpace(character):
+			pendingSpace = builder.Len() > 0
+		case unicode.IsControl(character) || !unicode.IsPrint(character):
+			// Dropped entirely: it carries no diagnostic value, it can corrupt a log stream,
+			// and leaving it in place would let it hide a value from the patterns above.
+		default:
+			if pendingSpace {
+				builder.WriteRune(' ')
+				pendingSpace = false
+			}
+			builder.WriteRune(character)
+		}
+	}
+	return strings.TrimSpace(builder.String())
+}
+
+// capRunes bounds text on a rune boundary, marking the elision so a reader can tell a truncated
+// value from a complete one. Cutting on runes rather than bytes keeps the result valid UTF-8.
+//
+// It is separate from the redaction steps so that a caller holding text that is already fully
+// redacted - a joined list of sanitized error entries, for instance - can bound it without
+// re-running the patterns.
+func capRunes(text string, maxRunes int) string {
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	return string(runes[:maxRunes]) + " ... (truncated)"
+}
+
+// parseRetryAfterHeader validates a Retry-After header and returns it only when it conforms to
+// the one shape RFC 9110 defines for the field: either delta-seconds, a non-negative integer, or
+// an HTTP-date.
+//
+// A header value is remote input like any other, so it is VALIDATED rather than merely quoted.
+// Anything else - a sentence, a duration with a unit, a negative number, an oversized blob - is
+// discarded and reported as absent, because Retry-After is not documented for the SendGrid v3 Web
+// API at all: an unrecognisable value carries no information worth the risk of recording it. A
+// delta is normalized to its canonical decimal form and a date to the canonical HTTP date format,
+// so what is recorded is this connector's own rendering rather than the provider's bytes.
+func parseRetryAfterHeader(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || len([]rune(trimmed)) > maxRetryAfterRunes {
+		return ""
+	}
+	if seconds, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		if seconds < 0 {
+			return ""
+		}
+		return strconv.FormatInt(seconds, 10)
+	}
+	if instant, err := http.ParseTime(trimmed); err == nil {
+		return instant.UTC().Format(http.TimeFormat)
+	}
+	return ""
+}
+
 // getDefaultHTTPClient returns an http.Client with standard configuration
 func getDefaultHTTPClient() *http.Client {
 	transport := &http.Transport{
 		MaxIdleConns:        defaultMaxConnsPerHost,
 		MaxIdleConnsPerHost: defaultMaxIdleConnsPerHost,
-		IdleConnTimeout:     defaultIdleConnTimeout,
+		// MaxConnsPerHost caps the number of connections that may be OPEN to one host at
+		// once, including the ones currently in flight. Left at its zero value the limit is
+		// unbounded, so a slow or wedged SendGrid endpoint combined with several batch router
+		// workers could accumulate connections until the process ran out of file
+		// descriptors - a failure that would take down every destination this process
+		// serves, not just this one. Bounding it turns that into backpressure instead.
+		MaxConnsPerHost: defaultMaxConnsPerHost,
+		IdleConnTimeout: defaultIdleConnTimeout,
 		// Disable compression to prevent BREACH attacks
 		DisableCompression: true,
 	}
@@ -222,7 +421,12 @@ func newErrorsDocumentHTTPClient(allowedHosts []string) *http.Client {
 		DialContext:         dialer.DialContext,
 		MaxIdleConns:        defaultMaxConnsPerHost,
 		MaxIdleConnsPerHost: defaultMaxIdleConnsPerHost,
-		IdleConnTimeout:     defaultIdleConnTimeout,
+		// Bounded for the same reason as the API client's transport, and it matters more
+		// here: this client's target host is chosen by the remote side, so an unbounded
+		// per-host connection count would let a provider-supplied URL decide how many
+		// sockets this process opens.
+		MaxConnsPerHost: defaultMaxConnsPerHost,
+		IdleConnTimeout: defaultIdleConnTimeout,
 		// Disable compression to prevent BREACH attacks, and to keep the transferred size
 		// equal to the size the read budget is applied to.
 		DisableCompression: true,
@@ -256,41 +460,94 @@ func controlPubliclyRoutableAddress(_, address string, _ syscall.RawConn) error 
 	if err != nil {
 		return fmt.Errorf("the dial address %q cannot be parsed: %w", address, err)
 	}
-	ip := net.ParseIP(host)
-	if ip == nil {
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
 		return fmt.Errorf("the dial address %q is not an ip address", host)
 	}
-	if !isPubliclyRoutableIP(ip) {
-		return fmt.Errorf("refusing to connect to the non publicly routable address %s", ip)
+	if !isPubliclyRoutableAddr(addr) {
+		return fmt.Errorf("refusing to connect to the non publicly routable address %s", addr)
 	}
 	return nil
 }
 
-// isPubliclyRoutableIP reports whether ip sits outside every range a server-side request
-// forgery would aim at: loopback, private, link-local (which covers 169.254.169.254),
-// carrier-grade NAT, multicast, unspecified and "this network".
+// nonGlobalPrefixes is the deny list of every prefix IANA records as special-purpose or not
+// globally reachable, in both address families.
 //
-// The address is unmapped first, so that an IPv4-mapped IPv6 form such as ::ffff:127.0.0.1
-// cannot slip past the IPv4 checks.
-func isPubliclyRoutableIP(ip net.IP) bool {
-	if ip == nil {
+// It is an explicit, exhaustive PREFIX list rather than a handful of hand-rolled octet
+// comparisons because an allow list of hosts is not a boundary on its own: an allowed host that
+// is compromised, or whose DNS answer is rebound, can resolve to any address at all, and every
+// entry below is an address that a request leaving this process must never be aimed at. A
+// partial list is the whole vulnerability - documentation, benchmarking, reserved and broadcast
+// space are all routed inside real networks, and 6to4 or NAT64 space can be used to express an
+// internal destination in a form that naive per-octet checks wave through.
+//
+// Sources: the IANA IPv4 Special-Purpose Address Registry and the IANA IPv6 Special-Purpose
+// Address Registry (RFC 6890 and its successors). Entries also covered by the netip.Addr
+// predicates applied alongside them are kept here deliberately, so the list can be read as a
+// complete statement of what is refused rather than as a delta against those predicates.
+var nonGlobalPrefixes = []netip.Prefix{
+	// IPv4.
+	netip.MustParsePrefix("0.0.0.0/8"),          // "this network"
+	netip.MustParsePrefix("10.0.0.0/8"),         // private
+	netip.MustParsePrefix("100.64.0.0/10"),      // carrier-grade NAT
+	netip.MustParsePrefix("127.0.0.0/8"),        // loopback
+	netip.MustParsePrefix("169.254.0.0/16"),     // link-local, covers the 169.254.169.254 metadata service
+	netip.MustParsePrefix("172.16.0.0/12"),      // private
+	netip.MustParsePrefix("192.0.0.0/24"),       // IETF protocol assignments
+	netip.MustParsePrefix("192.0.2.0/24"),       // TEST-NET-1, documentation
+	netip.MustParsePrefix("192.31.196.0/24"),    // AS112-v4
+	netip.MustParsePrefix("192.52.193.0/24"),    // AMT
+	netip.MustParsePrefix("192.88.99.0/24"),     // deprecated 6to4 relay anycast
+	netip.MustParsePrefix("192.168.0.0/16"),     // private
+	netip.MustParsePrefix("192.175.48.0/24"),    // direct delegation AS112
+	netip.MustParsePrefix("198.18.0.0/15"),      // benchmarking
+	netip.MustParsePrefix("198.51.100.0/24"),    // TEST-NET-2, documentation
+	netip.MustParsePrefix("203.0.113.0/24"),     // TEST-NET-3, documentation
+	netip.MustParsePrefix("224.0.0.0/4"),        // multicast, covers MCAST-TEST-NET
+	netip.MustParsePrefix("240.0.0.0/4"),        // reserved for future use
+	netip.MustParsePrefix("255.255.255.255/32"), // limited broadcast
+
+	// IPv6.
+	netip.MustParsePrefix("::/96"),             // unspecified, loopback and deprecated IPv4-compatible
+	netip.MustParsePrefix("::ffff:0:0/96"),     // IPv4-mapped; also handled by unmapping before the scan
+	netip.MustParsePrefix("64:ff9b::/96"),      // NAT64 IPv4/IPv6 translation
+	netip.MustParsePrefix("64:ff9b:1::/48"),    // local-use IPv4/IPv6 translation
+	netip.MustParsePrefix("100::/64"),          // discard-only
+	netip.MustParsePrefix("2001::/23"),         // IETF protocol assignments, covers TEREDO, benchmarking, AMT, AS112-v6 and ORCHIDv2
+	netip.MustParsePrefix("2001:db8::/32"),     // documentation
+	netip.MustParsePrefix("2002::/16"),         // deprecated 6to4
+	netip.MustParsePrefix("2620:4f:8000::/48"), // direct delegation AS112
+	netip.MustParsePrefix("3fff::/20"),         // documentation
+	netip.MustParsePrefix("5f00::/16"),         // segment routing SIDs
+	netip.MustParsePrefix("fc00::/7"),          // unique local
+	netip.MustParsePrefix("fe80::/10"),         // link-local unicast
+	netip.MustParsePrefix("ff00::/8"),          // multicast
+}
+
+// isPubliclyRoutableAddr reports whether addr is globally reachable, and therefore whether a
+// request may be sent to it at all.
+//
+// It is deliberately a deny list evaluated as "everything not explicitly refused is allowed to
+// be attempted", because the alternative - enumerating the public unicast space - is not
+// expressible. Both the netip.Addr predicates AND the full IANA prefix list are applied: the
+// predicates cover the categories the standard library can classify structurally, and the prefix
+// list covers the many special-purpose ranges it cannot.
+//
+// The address is UNMAPPED first, so that an IPv4-mapped IPv6 form such as ::ffff:127.0.0.1 is
+// evaluated against the IPv4 rules and cannot slip past them. netip.Prefix.Contains only ever
+// matches an address of its own family, so the two families in the list never interfere.
+func isPubliclyRoutableAddr(addr netip.Addr) bool {
+	if !addr.IsValid() {
 		return false
 	}
-	if unmapped := ip.To4(); unmapped != nil {
-		ip = unmapped
-	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
+	addr = addr.Unmap()
+	if addr.IsLoopback() || addr.IsPrivate() || addr.IsUnspecified() ||
+		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
+		addr.IsInterfaceLocalMulticast() || addr.IsMulticast() {
 		return false
 	}
-	if ip4 := ip.To4(); ip4 != nil {
-		switch {
-		case ip4[0] == 0: // 0.0.0.0/8 - "this network".
-			return false
-		case ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127: // 100.64.0.0/10 - carrier-grade NAT.
-			return false
-		case ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 0: // 192.0.0.0/24 - IETF assignments.
+	for _, prefix := range nonGlobalPrefixes {
+		if prefix.Contains(addr) {
 			return false
 		}
 	}
@@ -463,6 +720,14 @@ type sendGridAPIServiceImpl struct {
 // that any drift in the interface breaks the build here instead of surfacing at runtime.
 var _ SendGridAPIService = (*sendGridAPIServiceImpl)(nil)
 
+// sanitize is the adapter's bound view of sanitizeProviderText: the one place remote text is
+// cleaned, with this destination's credential supplied so it can be matched exactly as well as by
+// pattern. EVERY string this adapter derives from a response body or a response header goes
+// through it before it reaches an error value or a log field.
+func (s *sendGridAPIServiceImpl) sanitize(text string) string {
+	return sanitizeProviderText(text, s.apiKey)
+}
+
 // NewSendGridAPIService builds the SendGrid HTTP adapter for one destination.
 //
 // It reads the bearer credential out of the destination's configuration and FAILS OUTRIGHT
@@ -573,9 +838,15 @@ func (s *sendGridAPIServiceImpl) UploadContacts(request UpsertRequest) (*UpsertR
 		// A 202 carrying no job_id cannot be polled, so accepting it would strand the
 		// import in the importing state forever with nothing able to resolve it. Reporting
 		// it as a failed call keeps the affected jobs retryable instead.
+		//
+		// The body is SANITIZED even though the response was a semantic success. The status
+		// code says nothing about what the body contains: a debugging proxy answering 202 can
+		// echo the Authorization header straight back, and a body that quotes the submitted
+		// contacts carries their email addresses. Sanitization is therefore keyed on "this text
+		// came from the remote side", never on "the remote side reported a failure".
 		s.logger.Errorn("[sendgrid bulk upload] upload accepted without a job id",
 			logger.NewStringField("operation", opUploadContacts),
-			logger.NewStringField("responseBody", excerptResponseBody(body)))
+			logger.NewStringField("responseBody", s.sanitize(string(body))))
 		return nil, fmt.Errorf("sendgrid %s: response carried no job_id", opUploadContacts)
 	}
 
@@ -664,7 +935,13 @@ func (s *sendGridAPIServiceImpl) GetImportErrors(errorsURL string) ([]byte, erro
 
 	resp, err := s.errorsClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("sendgrid %s: %w", opGetImportErrors, err)
+		// This is the ONE transport error in the adapter whose text is not safe to wrap
+		// verbatim. net/http reports a failure as a *url.Error carrying the REQUEST URL, and
+		// this request's URL is provider-supplied - when the document is served from object
+		// storage its query string is a pre-signed credential. The message is therefore
+		// sanitized and flattened rather than wrapped: no typed error needs to survive here,
+		// because a dial, TLS or redirect failure is never a *RateLimitError or an *APIError.
+		return nil, fmt.Errorf("sendgrid %s: %s", opGetImportErrors, s.sanitize(err.Error()))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -739,16 +1016,25 @@ func (s *sendGridAPIServiceImpl) newRequest(operation, method, endpoint string, 
 // one. Because detection lives here, nothing else in the package may re-sniff a status code
 // for 429.
 //
-// It is also the single place a failing body is turned into text that gets kept, so it is where
-// any credential a provider or an intermediary echoed back is stripped out - once, for every
-// operation and both error types. The redaction produces a NEW slice and never touches the
-// caller's bytes, so the errors document GetImportErrors returns on success stays byte-identical.
+// It is also the single place a failing body is turned into text that gets kept, and it applies
+// the two protections in the only order that works. The CREDENTIAL is stripped from the BYTES
+// first, because the redaction placeholder contains no quote and no backslash and so leaves a
+// JSON body still decodable as an error envelope. Full sanitization - PII, control characters,
+// URL queries, length - is then applied to every string DERIVED from those bytes rather than to
+// the bytes themselves, because capping the bytes would truncate the envelope and destroy the
+// diagnostic the sanitization exists to preserve. Both steps produce NEW values and never touch
+// the caller's slice, so the errors document GetImportErrors returns on success stays
+// byte-identical.
 func (s *sendGridAPIServiceImpl) classifyResponse(operation string, successCode int, resp *http.Response, body []byte) error {
 	if resp.StatusCode != successCode || resp.StatusCode == http.StatusTooManyRequests {
 		body = []byte(redactCredentials(string(body), s.apiKey))
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		rateLimitErr := newRateLimitError(resp, body)
+		rateLimitErr := s.newRateLimitError(resp, body)
+		// Every field logged here is this connector's own rendering of a validated or
+		// sanitized value: RetryAfter survived parseRetryAfterHeader, the three numeric
+		// headers were parsed as integers, and Message was sanitized at construction. Nothing
+		// remote is logged raw.
 		s.logger.Warnn("[sendgrid bulk upload] rate limited by sendgrid",
 			logger.NewStringField("operation", operation),
 			logger.NewStringField("retryAfter", rateLimitErr.RetryAfter),
@@ -759,7 +1045,9 @@ func (s *sendGridAPIServiceImpl) classifyResponse(operation string, successCode 
 		return rateLimitErr
 	}
 	if resp.StatusCode != successCode {
-		apiErr := newAPIError(operation, resp, body)
+		apiErr := s.newAPIError(operation, resp, body)
+		// Safe to log the error itself: APIError renders only its status code, its operation,
+		// and the Message and envelope entries that were sanitized at construction.
 		s.logger.Errorn("[sendgrid bulk upload] sendgrid rejected the request",
 			logger.NewStringField("operation", operation),
 			logger.NewIntField("statusCode", int64(apiErr.StatusCode)),
@@ -779,40 +1067,69 @@ func (s *sendGridAPIServiceImpl) classifyResponse(operation string, successCode 
 // wait of decades, so it is kept as the absolute instant it is and rendered as one. Limit
 // and Remaining are captured purely so an operator can see how tight the window was.
 //
-// A header that is absent, empty or unparseable yields a zero value rather than an error:
+// A header that is absent, empty or UNPARSEABLE yields a zero value rather than an error:
 // the response was still a rate limit and must still be reported as one, and
 // RateLimitError.Error reports an absent window explicitly instead of rendering it as a
-// misleading instant.
-func newRateLimitError(resp *http.Response, body []byte) *RateLimitError {
+// misleading instant. Retry-After in particular is only kept when it is a valid delta-seconds
+// value or a valid HTTP-date - see parseRetryAfterHeader - so no unvalidated header text is ever
+// carried on the error, logged, or recorded against a job.
+func (s *sendGridAPIServiceImpl) newRateLimitError(resp *http.Response, body []byte) *RateLimitError {
 	return &RateLimitError{
 		StatusCode: resp.StatusCode,
-		RetryAfter: strings.TrimSpace(resp.Header.Get(headerRetryAfter)),
+		RetryAfter: parseRetryAfterHeader(resp.Header.Get(headerRetryAfter)),
 		ResetAt:    parseRateLimitHeaderValue(resp.Header, headerRateLimitReset),
 		Limit:      int(parseRateLimitHeaderValue(resp.Header, headerRateLimitLimit)),
 		Remaining:  int(parseRateLimitHeaderValue(resp.Header, headerRateLimitRemaining)),
-		Message:    describeResponseBody(body),
+		Message:    s.describeResponseBody(body),
 	}
 }
 
 // newAPIError builds the error for a SendGrid response that is neither the expected success
 // nor a rate limit. The status code is carried explicitly so that the manager can map the
 // outcome onto the batch router's retryable or terminal channel without re-parsing anything.
-func newAPIError(operation string, resp *http.Response, body []byte) *APIError {
+//
+// Every string it carries is sanitized here, at construction, rather than at the sinks that read
+// them. That is what makes the guarantee hold: this error is rendered into a log line, into an
+// upload's failure reason, and into a poll response's error text, and an unsanitized field would
+// have to be caught at all three.
+func (s *sendGridAPIServiceImpl) newAPIError(operation string, resp *http.Response, body []byte) *APIError {
 	apiErr := &APIError{
 		StatusCode: resp.StatusCode,
 		Operation:  operation,
-		Errors:     decodeAPIErrorItems(body),
+		Errors:     s.sanitizeAPIErrorItems(decodeAPIErrorItems(body)),
 	}
 	if len(apiErr.Errors) == 0 {
 		// The body was absent, empty, or not a SendGrid error envelope at all - an HTML
 		// page from an edge proxy, for instance - so a bounded excerpt of it is the only
 		// diagnostic an operator is going to get.
-		apiErr.Message = excerptResponseBody(body)
+		apiErr.Message = s.sanitize(string(body))
 		if apiErr.Message == "" {
 			apiErr.Message = "sendgrid returned an empty response body"
 		}
 	}
 	return apiErr
+}
+
+// sanitizeAPIErrorItems sanitizes both halves of every decoded envelope entry.
+//
+// The field NAME is sanitized as well as the message, because it is provider-supplied text like
+// any other and nothing guarantees it names a field this connector sent. The nil field the
+// documented rate-limit body carries is preserved as nil, so that "no field" stays
+// distinguishable from an empty field name.
+func (s *sendGridAPIServiceImpl) sanitizeAPIErrorItems(items []APIErrorItem) []APIErrorItem {
+	if len(items) == 0 {
+		return nil
+	}
+	sanitized := make([]APIErrorItem, 0, len(items))
+	for _, item := range items {
+		clean := APIErrorItem{Message: s.sanitize(item.Message)}
+		if item.Field != nil {
+			field := s.sanitize(*item.Field)
+			clean.Field = &field
+		}
+		sanitized = append(sanitized, clean)
+	}
+	return sanitized
 }
 
 // describeResponseBody renders a response body as a single-line summary fit for an error
@@ -823,8 +1140,12 @@ func newAPIError(operation string, resp *http.Response, body []byte) *APIError {
 // {"errors":[{"field":null,"message":"too many requests"}]}. Anything else falls back to a
 // bounded excerpt of the raw bytes, so an operator is never left holding nothing but a bare
 // status code.
-func describeResponseBody(body []byte) string {
-	items := decodeAPIErrorItems(body)
+//
+// Both routes are sanitized, so the summary is safe wherever it ends up: it becomes
+// RateLimitError.Message, which is rendered into a rate-limited upload's persisted failure
+// reason.
+func (s *sendGridAPIServiceImpl) describeResponseBody(body []byte) string {
+	items := s.sanitizeAPIErrorItems(decodeAPIErrorItems(body))
 	rendered := make([]string, 0, len(items))
 	for _, item := range items {
 		if text := strings.TrimSpace(item.String()); text != "" {
@@ -832,9 +1153,9 @@ func describeResponseBody(body []byte) string {
 		}
 	}
 	if len(rendered) > 0 {
-		return strings.Join(rendered, "; ")
+		return capRunes(strings.Join(rendered, "; "), maxReasonRunes)
 	}
-	return excerptResponseBody(body)
+	return s.sanitize(string(body))
 }
 
 // decodeAPIErrorItems decodes a SendGrid error envelope on a best-effort basis.
@@ -852,24 +1173,6 @@ func decodeAPIErrorItems(body []byte) []APIErrorItem {
 		return nil
 	}
 	return envelope.Errors
-}
-
-// excerptResponseBody renders a bounded, single-line excerpt of a raw response body.
-//
-// Runs of whitespace - newlines included - are collapsed to single spaces so the excerpt
-// cannot break up a structured log line, and truncation happens on a rune boundary so the
-// result is always valid UTF-8. The bound matters because this text can end up stored as a
-// job's failure reason.
-func excerptResponseBody(body []byte) string {
-	collapsed := strings.Join(strings.Fields(string(body)), " ")
-	if collapsed == "" {
-		return ""
-	}
-	runes := []rune(collapsed)
-	if len(runes) <= maxResponseBodyExcerptRunes {
-		return collapsed
-	}
-	return string(runes[:maxResponseBodyExcerptRunes]) + " ... (truncated)"
 }
 
 // parseRateLimitHeaderValue reads one advisory rate-limit header as a base-10 integer,
