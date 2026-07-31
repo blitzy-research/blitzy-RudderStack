@@ -312,12 +312,13 @@ const externalIDTypeListIDs = "listIds"
 
 // Reasons recorded against jobs this connector rejects locally, before any request is made.
 //
-// All four conditions are PERMANENT: the batch router would rebuild an identical payload on a
-// retry, so retrying could only ever fail again and would burn the retry budget for nothing.
+// Every one of these conditions is PERMANENT: the batch router would rebuild an identical payload
+// on a retry, so retrying could only ever fail again and would burn the retry budget for nothing.
 // They are therefore the only LOCAL outcomes in this connector that use the terminal abort
-// channel. Three of them abandon exactly one job; the fourth - list IDs that consume a whole
-// request's budget - abandons the group of jobs that target those lists, because the condition
-// belongs to the destination's configuration rather than to any single contact.
+// channel. All but one abandon exactly the record that carries the condition; the exception -
+// list IDs that consume a whole request's budget - abandons the group of jobs that target those
+// lists, because the condition belongs to the targeting shared by the group rather than to any
+// single contact.
 //
 // Exactly one other terminal outcome exists anywhere in this connector, and it is not local: an
 // import SendGrid itself declared failed, which the provider defines as finished with all errors
@@ -359,6 +360,24 @@ const (
 	// contact to travel with them. The list IDs come from the destination's configuration or from
 	// the events' own external IDs, so every retry would rebuild the same oversized envelope.
 	reasonListIDsTooLarge = "the sendgrid list ids these contacts target consume the entire request budget, so no contact can be uploaded alongside them"
+
+	// reasonTooManyListIDs is recorded when one event's own context.externalId targeting names more
+	// DISTINCT SendGrid lists than this connector will send for a single contact.
+	//
+	// Rejecting the record is the only honest outcome, and it is the same choice
+	// reasonTooManyFieldValues makes for a multi-valued field. Per-event targeting is the
+	// HIGHEST-PRECEDENCE list request there is: it overrides the destination's configuration
+	// entirely, so sending a truncated version of it would upsert the contact onto some of the
+	// lists the event asked for and silently onto none of the rest, while reporting success. That
+	// is a wrong delivery presented as a right one. Falling back to the configured list IDs instead
+	// would be worse still - it would deliver the contact to lists the event never named.
+	//
+	// The bound itself exists because the targeting arrives inside an event payload, so its length
+	// is not this connector's to trust: a single record must not be able to size the work of
+	// resolving it. A contact addressed to more than maxListIDsPerContact distinct lists is a
+	// mistake in the producing integration rather than a campaign, and the mistake is now reported
+	// rather than absorbed.
+	reasonTooManyListIDs = "this event targets more distinct sendgrid lists than this connector will send for a single contact, so it was not uploaded rather than being delivered to only some of them"
 )
 
 // defaultFailureReason is recorded for an errored row whose document carried no message, so
@@ -459,6 +478,7 @@ const identifierRedactionPlaceholder = "[redacted-identifier]"
 var (
 	errFieldTooLong       = errors.New(reasonFieldTooLong)
 	errTooManyFieldValues = errors.New(reasonTooManyFieldValues)
+	errTooManyListIDs     = errors.New(reasonTooManyListIDs)
 )
 
 // The bounds this connector applies to the reserved contact fields before putting them on the wire.
@@ -497,12 +517,20 @@ const (
 // prepared to build out of them, so that a document within the byte budget still cannot turn
 // into an unbounded number of rows or an unbounded nesting depth.
 const (
-	// maxErrorRows bounds how many rows are taken from an import IN TOTAL, not from each of its
-	// documents: one upload can produce several SendGrid imports and therefore several errors
-	// documents, and a per-document bound would let their number multiply the total. Each document
-	// is parsed against what the earlier ones left of this allowance. It sits far above the 30,000
-	// contacts one request can carry, so it can only be reached by documents that do not describe
-	// a single import.
+	// maxErrorRows bounds how many rows ONE errors document may contribute, and is also the FLOOR of
+	// the allowance every document of an upload shares between them.
+	//
+	// Two roles, because two different things are being protected. The per-document ceiling bounds
+	// PEAK memory: rows are attributed and released one document at a time, so the most this method
+	// ever holds is a single document's worth, and that has to stay bounded however large the upload
+	// is. It sits far above the 30,000 contacts one request can carry, so only a document that does
+	// not describe a single import can reach it. The shared allowance bounds TOTAL work instead: one
+	// upload can produce several imports and therefore several errors documents, and a per-document
+	// bound alone would let their number multiply the total, so each document is parsed against what
+	// the earlier ones left of the allowance.
+	//
+	// The allowance is a FLOOR rather than the whole rule because a flat one made large uploads
+	// unreconcilable - see errorRowAllowance, which is the single place that rule lives.
 	maxErrorRows = 100000
 
 	// maxErrorsDocumentDepth bounds the document's JSON nesting depth. Every shape the parser
@@ -1029,31 +1057,77 @@ func (b *SendGridBulkUploader) buildCustomFields(message, traits gjson.Result) (
 //
 // An entry's id is accepted both as an array of list IDs and as a single string, because both
 // shapes occur in the wild, and the entry type is matched case-insensitively.
-func (b *SendGridBulkUploader) resolveListIDs(message gjson.Result) []string {
+//
+// NORMALIZATION AND THE BOUND HAPPEN TOGETHER, WHILE THE VALUES ARE COLLECTED, and that ordering is
+// the whole point of the collector below. The bound used to be charged against the RAW values and
+// the de-duplication run afterwards, which made a repeated list ID cost budget: an event naming the
+// same list maxListIDsPerContact times and then one further, genuinely different list stopped
+// collecting before it reached the different one, normalized down to a single list, and was
+// upserted onto that one list alone - a silent change to the highest-precedence targeting there is,
+// reported as a success. Charging only DISTINCT values fixes that, and it makes the bound mean what
+// it says: how many lists one contact may be addressed to.
+//
+// Exceeding the bound is reported rather than absorbed. An event that genuinely names more distinct
+// lists than this connector will send is refused with errTooManyListIDs, because the alternative -
+// delivering the contact to a truncated subset - is a wrong delivery presented as a right one.
+// Collection stops at the first distinct value past the bound, so a hostile or broken event still
+// cannot make this function allocate in proportion to how many lists it declares.
+func (b *SendGridBulkUploader) resolveListIDs(message gjson.Result) ([]string, error) {
 	if externalIDs := message.Get("context.externalId"); externalIDs.IsArray() {
-		// Streamed and bounded rather than materialized: the array is provider-of-record only in
-		// the sense that the event author controls it, so its length is not this connector's to
-		// trust. maxListIDsPerContact is far beyond any real targeting - a contact addressed to
-		// more than 64 lists is a mistake, not a campaign - and stopping there keeps one record's
-		// declared targeting from sizing the work this function does.
 		listIDs := make([]string, 0, 1)
+		seen := make(map[string]struct{}, 1)
+		exceeded := false
+		// collect adds one candidate and reports whether collection should continue. Trimming and
+		// de-duplication happen here, so listIDs is already the exact value the request body
+		// carries - in first-appearance order, which is what keeps the batching key deterministic.
+		collect := func(candidate gjson.Result) bool {
+			listID := scalarString(candidate)
+			if listID == "" {
+				return true
+			}
+			if _, duplicate := seen[listID]; duplicate {
+				return true
+			}
+			if len(listIDs) == maxListIDsPerContact {
+				// One distinct value beyond the bound is enough to know the event asked for more
+				// than can be sent, and it is where collection stops.
+				exceeded = true
+				return false
+			}
+			seen[listID] = struct{}{}
+			listIDs = append(listIDs, listID)
+			return true
+		}
 		externalIDs.ForEach(func(_, entry gjson.Result) bool {
 			if !strings.EqualFold(scalarString(entry.Get("type")), externalIDTypeListIDs) {
 				return true
 			}
 			id := entry.Get("id")
-			if id.IsArray() {
-				listIDs = append(listIDs, stringSliceOf(id, maxListIDsPerContact-len(listIDs))...)
-			} else if value := scalarString(id); value != "" {
-				listIDs = append(listIDs, value)
+			if !id.IsArray() {
+				return collect(id)
 			}
-			return len(listIDs) < maxListIDsPerContact
+			// Every element passes the same scalar guard a single-valued id does, so a nested
+			// object inside the array cannot become a list ID.
+			keepGoing := true
+			id.ForEach(func(_, element gjson.Result) bool {
+				keepGoing = collect(element)
+				return keepGoing
+			})
+			return keepGoing
 		})
-		if normalized := normalizeListIDs(listIDs); len(normalized) > 0 {
-			return normalized
+		if exceeded {
+			return nil, fmt.Errorf("%w: the event targets more than %d distinct sendgrid lists",
+				errTooManyListIDs, maxListIDsPerContact)
+		}
+		if len(listIDs) > 0 {
+			return listIDs, nil
 		}
 	}
-	return normalizeListIDs(b.DestinationConfig.ListIDs)
+	// No per-event targeting, or an entry that carried no usable list ID at all: the destination's
+	// configuration is the documented fallback. It is operator-controlled rather than event-derived,
+	// so it is normalized but not bounded here - list IDs large enough to fill a whole request are
+	// caught by the envelope budget, with reasonListIDsTooLarge naming that cause exactly.
+	return normalizeListIDs(b.DestinationConfig.ListIDs), nil
 }
 
 // contactBatch is a set of contacts that share the same target list IDs and can therefore
@@ -1099,6 +1173,13 @@ type stagedContacts struct {
 	// unsendableReason is the terminal reason the unsendable records carry, taken from the first
 	// such record's sentinel so a length rejection is never reported as a count rejection.
 	unsendableReason string
+
+	// overTargetedJobIDs are jobs whose event named more distinct SendGrid lists than this connector
+	// will send for one contact. Kept in their own bucket, rather than folded in with the unsendable
+	// records, because the durable reason has to name the actual cause: "this event targets too many
+	// lists" and "a field of this contact is too long" are different mistakes, made in different
+	// parts of the payload, and fixed in different places.
+	overTargetedJobIDs []int64
 
 	// malformedJobIDs are jobs whose staging line was malformed but still carried a usable job
 	// ID. The same bytes would fail identically on every retry, so these are reported on the
@@ -1295,6 +1376,24 @@ func (b *SendGridBulkUploader) readStagedContacts(filePath string, statLabels st
 				obskit.Error(err))
 			continue
 		}
+
+		// Targeting is resolved BEFORE the contact is serialized, because a record whose targeting
+		// cannot be honored is not going to be sent: sizing it would charge the contact_size
+		// histogram for a contact that never travels, and serializing it would be work done for a
+		// value that is discarded on the next line.
+		listIDs, err := b.resolveListIDs(message)
+		if err != nil {
+			// Permanent, exactly like the other local rejections: the same event names the same
+			// lists on every retry. Reported against this one record, so the rest of the batch -
+			// including other events targeting other lists - is unaffected.
+			staged.overTargetedJobIDs = append(staged.overTargetedJobIDs, jobID)
+			b.Logger.Warnn("[sendgrid bulk upload] skipping event whose list targeting cannot be honored",
+				logger.NewIntField("jobID", jobID),
+				logger.NewIntField("maxListIDsPerContact", int64(maxListIDsPerContact)),
+				obskit.Error(err))
+			continue
+		}
+
 		// Serialized exactly ONCE per contact, here. The length is both the value the contact_size
 		// histogram reports and the size the chunker packs against, so the metric and the byte
 		// budgeting are the same measurement rather than two independent ones - and the contact is
@@ -1313,7 +1412,6 @@ func (b *SendGridBulkUploader) readStagedContacts(filePath string, statLabels st
 		}
 		contactSizeStat.Observe(float64(len(contactJSON)))
 
-		listIDs := b.resolveListIDs(message)
 		key := listIDsKey(listIDs)
 		index, ok := batchIndex[key]
 		if !ok {
@@ -1540,6 +1638,14 @@ func (b *SendGridBulkUploader) Upload(asyncDestStruct *common.AsyncDestinationSt
 		abortedJobIDs = append(abortedJobIDs, staged.unsendableJobIDs...)
 		abortReasons = append(abortReasons, staged.unsendableReason)
 		b.StatsFactory.NewTaggedStat("unsendable_contact_count", stats.CountType, statLabels).Count(len(staged.unsendableJobIDs))
+	}
+	if len(staged.overTargetedJobIDs) > 0 {
+		abortedJobIDs = append(abortedJobIDs, staged.overTargetedJobIDs...)
+		abortReasons = append(abortReasons, reasonTooManyListIDs)
+		// Counted separately from the unsendable contacts, so that a producing integration emitting
+		// unusable list targeting is visible as its own signal rather than as a rise in a metric
+		// that also moves for over-long fields.
+		b.StatsFactory.NewTaggedStat("over_targeted_contact_count", stats.CountType, statLabels).Count(len(staged.overTargetedJobIDs))
 	}
 	if len(staged.malformedJobIDs) > 0 {
 		abortedJobIDs = append(abortedJobIDs, staged.malformedJobIDs...)
@@ -2208,14 +2314,23 @@ func (b *SendGridBulkUploader) pollErrorResponse(err error, importID string) com
 // situations in which no reconciliation whatsoever is possible, and the batch router retries them.
 //
 // A row the document holds but this method cannot attribute - one the parser did not recognize,
-// or one whose identifier resolves to no importing job - is COUNTED AND LOGGED, and nothing else.
-// It is emphatically not turned into a verdict on jobs it never named: an unattributable row is
-// evidence about the DOCUMENT, not about any particular contact, and the one thing that must
-// never follow from it is a blanket failure of an entire import's jobs. That was the previous
-// behavior and it was wrong twice over - it retried thousands of contacts SendGrid had accepted
-// because one row was unreadable, and it left SucceededKeys empty for a batch that had almost
-// entirely succeeded. The counters and warnings are what make such a row visible, and they turn a
-// change in the undocumented document shape into a metric rather than into churn.
+// or one whose identifier resolves to no importing job - is COUNTED, LOGGED, and then made to
+// FAIL ITS OWN IMPORT CLOSED: every still-unresolved job of the import that published that
+// document is placed in FailedKeys, which is retryable, and no job of that import is reported
+// delivered. Such a row is proof that SendGrid rejected a contact of that import WITHOUT saying
+// which one, and from that moment reconciliation by exclusion is unsound for it - "no row named
+// this job" stops meaning "this job was delivered", which is the same asymmetry the paragraph
+// below states in general.
+//
+// The blast radius is deliberately the AFFECTED IMPORT and not the whole upload. Per-import
+// membership is persisted precisely so that one import's unreadable evidence leaves its siblings
+// independently reconcilable - a clean import of the same upload still reports its jobs succeeded,
+// which is what lets a single reconciliation yield both failures and successes. Only when the
+// affected import's membership cannot be recovered at all does the conservative verdict widen to
+// the upload's remaining jobs, because there is then no way to say which jobs the import held.
+// Jobs a row DID name keep their own specific reason, because failJob never overwrites the first
+// reason recorded for a job. The counters and warnings are what make such a row visible, and they
+// turn a change in the undocumented document shape into a metric rather than into silence.
 //
 // Where evidence genuinely IS missing, the response is scoped to the jobs it is missing about and
 // is always retryable. SendGrid upserts contacts, so re-sending one that in fact succeeded costs a
@@ -2541,11 +2656,14 @@ func (b *SendGridBulkUploader) attributeErrorRows(
 			// which document, which row within it, out of how many - is all an operator needs to
 			// find the entry in the document itself, and it identifies nobody.
 			//
-			// The row is not attributed - this method cannot invent an attribution - and it is
-			// deliberately not escalated either. It says a contact was rejected without saying
-			// which, which is evidence about the document and not about any job the document
-			// never named, so it is counted and warned about and the jobs it says nothing about
-			// are left to be settled by their own import's state.
+			// The row is not attributed - this method cannot invent an attribution - so it is
+			// counted and returned to the caller rather than acted on here. The escalation belongs
+			// there and not in this loop: an unmatched row says a contact of this document's import
+			// was rejected without saying which, which is a verdict about the whole IMPORT, and only
+			// the caller knows every document that import published and which jobs it carried. What
+			// the caller then does with this count is fail that import's still-unresolved jobs
+			// closed, retryably, so none of them is reported delivered on evidence known to be
+			// incomplete.
 			unmatched++
 			b.Logger.Warnn("[sendgrid bulk upload] errored row could not be matched to an importing job",
 				logger.NewIntField("documentIndex", int64(documentIndex)),
@@ -2758,6 +2876,39 @@ type errorRowCounts struct {
 	ambiguous int
 }
 
+// errorRowAllowance is how many errors-document rows the whole of one upload's reconciliation may
+// read, derived from the number of importing jobs it was handed.
+//
+// A FLAT allowance was tried first and was wrong. One upload may create up to maxImportsPerUpload
+// imports of up to sendGridMaxContactsPerRequest contacts each, so it can legitimately carry far
+// more contacts than maxErrorRows - and if every one of them is rejected, a truthful set of errors
+// documents holds a row for every one of them. Against a flat allowance an ordinary large upload
+// therefore became one whose evidence this connector refused to finish reading, and a refusal here
+// is not harmless: the batch router writes NO job status at all for a non-200 from GetUploadStats and
+// its poll route has no retry budget that could escalate, so every job of that upload would stay
+// importing forever and the destination would stop accepting new work.
+//
+// Deriving the allowance from the importing list closes that off exactly, because SendGrid cannot
+// report an errored contact it was never sent: a truthful set of documents holds at most one row
+// per contact the upload uploaded, which is at most one row per importing job. So the allowance is
+// raised to one row per importing job whenever an upload carries more contacts than the floor.
+//
+// This is deliberately NOT a weakening of the bound it replaces:
+//
+//   - Peak memory is untouched. maxErrorRows still caps how many rows a SINGLE document may
+//     contribute, and rows are attributed and released one document at a time, so the most this
+//     method ever holds at once is exactly what it held before.
+//   - The upload's own size is not provider-controlled. It is this connector's job count, not a
+//     number read out of a response, so a hostile document cannot inflate its own allowance.
+//   - What the allowance now permits is at most one row per entry of an index this method has
+//     already built and holds for its whole duration, so the work it authorizes stays the same
+//     order as the work the caller has already committed to.
+//   - Small uploads are completely unaffected: the floor keeps their allowance exactly as generous
+//     as it was.
+func errorRowAllowance(importingJobCount int) int {
+	return max(maxErrorRows, importingJobCount)
+}
+
 // readErrorRows fetches, parses and attributes the errors document of every import that has one
 // worth reading, and returns what it read.
 //
@@ -2767,9 +2918,11 @@ type errorRowCounts struct {
 // read them, so rows from two documents never coexist. It is also why the counts are returned
 // rather than the rows.
 //
-// The row budget is what REMAINS of the import's allowance at each step, not a fresh per-document
-// one: an import that published several documents must not be able to multiply the bound by
-// publishing more of them.
+// The row budget handed to each document is the LOWER of two bounds: what remains of the upload's
+// shared allowance, so an import that published several documents cannot multiply the bound by
+// publishing more of them, and maxErrorRows, so no single document can be read into more rows than
+// this method is willing to hold at one time. The shared allowance is derived from the importing
+// list rather than fixed, for the reason errorRowAllowance sets out in full.
 //
 // A rejected import's document is skipped deliberately: its jobs are already settled terminally by
 // the import's own state, so reading it could only produce rows naming contacts that are already
@@ -2791,6 +2944,9 @@ func (b *SendGridBulkUploader) readErrorRows(
 	outcomes []importOutcome,
 ) (errorRowCounts, map[string]int, common.GetUploadStatsResponse) {
 	var counts errorRowCounts
+	// Resolved once, from the population every branch of the reconciliation works from, so that
+	// every document of this upload is measured against the same allowance.
+	allowance := errorRowAllowance(len(index.jobIDs))
 	// Keyed by the document's URL rather than by import, because one URL can be published by
 	// several imports of an upload and is read exactly once: keying it this way lets the caller
 	// attribute what a document could not explain back to EVERY import that pointed at it.
@@ -2824,7 +2980,9 @@ func (b *SendGridBulkUploader) readErrorRows(
 				Error:      sanitizeReason("Failed to fetch the sendgrid errors document: " + err.Error()),
 			}
 		}
-		parsedDocument, err := parseImportErrors(document, maxErrorRows-counts.total)
+		// The lower of what the upload has left and what one document may ever contribute, so that
+		// neither the shared allowance nor the per-document ceiling can be exceeded by the other.
+		parsedDocument, err := parseImportErrors(document, min(allowance-counts.total, maxErrorRows))
 		if err != nil {
 			// The document could not be understood at all. Retrying is the safe failure mode:
 			// reporting success here would silently deliver contacts SendGrid rejected.
@@ -3015,10 +3173,12 @@ func jsonDepth(document []byte) int {
 // reconciliation refuse to infer success for the rest of the import, and it is the difference
 // between a tolerant parser and a lossy one.
 //
-// rowBudget is how many rows this document is still allowed to contribute: the caller passes what
-// REMAINS of the import's allowance, so an import cannot multiply the bound by publishing several
-// documents. A document that would exceed it is reported as an error rather than truncated, because
-// a truncated errors document reconciles as though the rows it dropped had never failed.
+// rowBudget is how many rows this document is still allowed to contribute. The caller passes the
+// lower of what REMAINS of the upload's shared allowance - so an import cannot multiply the bound by
+// publishing several documents - and the per-document ceiling, so no one document can be read into
+// more rows than the caller is willing to hold at once. A document that would exceed it is reported
+// as an error rather than truncated, because a truncated errors document reconciles as though the
+// rows it dropped had never failed.
 //
 // Whether the bytes are one well-formed JSON value at all is decided WITHOUT materializing them:
 // the check walks the bytes and answers yes or no, where decoding into an untyped value built the
@@ -3048,7 +3208,7 @@ func parseImportErrors(document []byte, rowBudget int) (importErrorsDocument, er
 	if root.IsArray() {
 		scan := streamImportErrorRows(root, rowBudget)
 		if scan.overBudget {
-			return importErrorsDocument{}, fmt.Errorf("the errors document holds more than the %d rows still allowed for this import", rowBudget)
+			return importErrorsDocument{}, fmt.Errorf("the errors document holds more than the %d rows still allowed for this upload", rowBudget)
 		}
 		if len(scan.rows) > 0 {
 			return importErrorsDocument{Rows: scan.rows, UnrecognizedRows: scan.unrecognized, ScannedRows: scan.scanned}, nil
@@ -3060,7 +3220,7 @@ func parseImportErrors(document []byte, rowBudget int) (importErrorsDocument, er
 			if wrapped := root.Get(key); wrapped.IsArray() {
 				scan := streamImportErrorRows(wrapped, rowBudget)
 				if scan.overBudget {
-					return importErrorsDocument{}, fmt.Errorf("the errors document's %q array holds more than the %d rows still allowed for this import", key, rowBudget)
+					return importErrorsDocument{}, fmt.Errorf("the errors document's %q array holds more than the %d rows still allowed for this upload", key, rowBudget)
 				}
 				if len(scan.rows) > 0 {
 					return importErrorsDocument{Rows: scan.rows, UnrecognizedRows: scan.unrecognized, ScannedRows: scan.scanned}, nil
@@ -3069,7 +3229,7 @@ func parseImportErrors(document []byte, rowBudget int) (importErrorsDocument, er
 			}
 		}
 		if rowBudget < 1 {
-			return importErrorsDocument{}, fmt.Errorf("the errors document holds a row, more than the %d still allowed for this import", rowBudget)
+			return importErrorsDocument{}, fmt.Errorf("the errors document holds a row, more than the %d still allowed for this upload", rowBudget)
 		}
 		if row, ok := importErrorRowFrom(root); ok {
 			return importErrorsDocument{Rows: []ImportErrorRow{row}, ScannedRows: 1}, nil
@@ -3204,7 +3364,7 @@ func parseNewlineDelimitedImportErrors(document []byte, rowBudget int) (importEr
 		// budget rather than reading the rest of the document to discover it was too long.
 		parsedDocument.ScannedRows++
 		if parsedDocument.ScannedRows > rowBudget {
-			return importErrorsDocument{}, fmt.Errorf("the errors document holds more than the %d rows still allowed for this import", rowBudget)
+			return importErrorsDocument{}, fmt.Errorf("the errors document holds more than the %d rows still allowed for this upload", rowBudget)
 		}
 		if !gjson.ValidBytes(line) {
 			parsedDocument.UnrecognizedRows++
@@ -3235,7 +3395,10 @@ func parseNewlineDelimitedImportErrors(document []byte, rowBudget int) (importEr
 //
 // A row is usable as soon as it carries either, and it reports false only when it carries
 // neither - a row with a message but no resolvable identifier is still worth keeping, because it
-// is then counted and logged as unmatched instead of vanishing.
+// is then counted and logged as unmatched rather than vanishing, and that count is what makes its
+// import fail closed instead of being reconciled by exclusion against evidence known to be
+// incomplete. A row this function rejects outright is counted too, by the caller, for the same
+// reason: nothing about an errors document is allowed to disappear silently.
 //
 // The identifier is lower-cased here so that everything downstream compares like with like.
 func importErrorRowFrom(entry gjson.Result) (ImportErrorRow, bool) {

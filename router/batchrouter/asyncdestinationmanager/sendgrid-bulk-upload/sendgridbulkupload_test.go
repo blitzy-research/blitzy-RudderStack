@@ -162,6 +162,40 @@ func fixtureJobs(t *testing.T, jobIDs ...int64) []*jobsdb.JobT {
 	return jobs
 }
 
+// firstSyntheticContact is the contact identifier syntheticImportingJobs gives its FIRST job, and
+// therefore the one address a synthetic errors document can name to attribute to exactly one job.
+const firstSyntheticContact = "user1@example.com"
+
+// syntheticImportingJobs builds an importing list of the given size, each entry in exactly the
+// staging-file shape Transform writes, so that reconciliation can re-derive every contact identifier
+// from it the way it does in production.
+//
+// The committed five-line fixture cannot express an upload larger than the errors-row allowance's
+// floor, and that is the only size at which the allowance's derivation from the upload it is
+// reconciling becomes observable through the exported surface at all. Job N carries
+// userN@example.com, so firstSyntheticContact resolves to exactly one job however large the list is.
+func syntheticImportingJobs(t *testing.T, count int) []*jobsdb.JobT {
+	t.Helper()
+
+	jobs := make([]*jobsdb.JobT, 0, count)
+	for jobID := int64(1); jobID <= int64(count); jobID++ {
+		jobs = append(jobs, &jobsdb.JobT{JobID: jobID, EventPayload: []byte(contactLine(t, jobID))})
+	}
+	return jobs
+}
+
+// errorsDocumentNaming renders a wrapped errors document of the given row count, every row naming the
+// same contact, with the last row carrying a message so the reason a job records is a real one.
+//
+// One address throughout is deliberate: it keeps a case about the row ALLOWANCE from also being a
+// case about matching, because every row attributes to exactly one job and no row can be
+// unattributable.
+func errorsDocumentNaming(email string, rows int) string {
+	return `{"errors":[` +
+		strings.Repeat(`{"email":"`+email+`"},`, rows-1) +
+		`{"email":"` + email + `","message":"rejected"}]}`
+}
+
 // importParametersOf reads back what Upload persisted, through the SAME gjson path the batch router
 // uses in getPollInput. Asserting on the router's own read is the point: a value the router cannot
 // recover would strand every job of the batch in the importing state.
@@ -1897,10 +1931,49 @@ func TestGetUploadStatsEdgeCases(t *testing.T) {
 	})
 }
 
+// supportedDistinctListIDs mirrors the connector's unexported maxListIDsPerContact: how many
+// DISTINCT SendGrid lists one event's context.externalId targeting may name.
+//
+// Mirrored rather than exported, for the same reason persistedManifestBudget is: the bound is an
+// internal invariant, and widening the package's API so a test could read it would be the test
+// changing what it observes. The cases below pin it from BOTH sides - the largest targeting that is
+// honored in full, and the smallest that is refused - so a change to the connector's bound that is
+// not reflected here fails one of them rather than passing vacuously.
+const supportedDistinctListIDs = 64
+
+// distinctListIDs builds count list IDs that are all different from one another.
+func distinctListIDs(count int) []string {
+	listIDs := make([]string, 0, count)
+	for index := 0; index < count; index++ {
+		listIDs = append(listIDs, fmt.Sprintf("list-%04d", index))
+	}
+	return listIDs
+}
+
+// listTargetingLine renders one staged identify event whose context.externalId targets exactly the
+// given lists, in the given order, through a single listIds entry.
+func listTargetingLine(t *testing.T, jobID int64, listIDs ...string) string {
+	t.Helper()
+
+	quoted := make([]string, 0, len(listIDs))
+	for _, listID := range listIDs {
+		quoted = append(quoted, strconv.Quote(listID))
+	}
+	return stagingLine(t, jobID, fmt.Sprintf(
+		`{"type":"identify","userId":"user_%d","traits":{"email":"user%d@example.com"},`+
+			`"context":{"externalId":[{"type":"listIds","id":[%s]}]}}`,
+		jobID, jobID, strings.Join(quoted, ",")))
+}
+
 // TestUploadListIDResolution pins the precedence this repository already documents for SendGrid: a
 // per-event context.externalId entry of type listIds wins, and the destination configuration is the
 // fallback. Contacts targeting different lists cannot share a request body, so the resolution also
 // decides how the batch is grouped.
+//
+// Per-event targeting is the highest-precedence list request there is, which is why the cases below
+// go further than "the override is used" and pin exactly WHICH lists reach the wire: a resolution
+// that quietly delivered a contact to some of the lists an event named, and none of the rest, would
+// satisfy every assertion about precedence while getting the delivery wrong.
 func TestUploadListIDResolution(t *testing.T) {
 	t.Parallel()
 
@@ -1997,6 +2070,162 @@ func TestUploadListIDResolution(t *testing.T) {
 		})
 
 		require.Equal(t, []int64{1}, output.ImportingJobIDs)
+	})
+
+	t.Run("every distinct list up to the bound reaches the request", func(t *testing.T) {
+		t.Parallel()
+
+		// The accepting side of the bound, one below it and exactly at it, asserted on the request
+		// body itself: the whole targeting has to travel, in the order the event named it, because
+		// the list_ids array is what decides where the contact ends up.
+		for name, distinctCount := range map[string]int{
+			"one below the bound":  supportedDistinctListIDs - 1,
+			"exactly at the bound": supportedDistinctListIDs,
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				targeted := distinctListIDs(distinctCount)
+
+				api := newMockAPI(t)
+				api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+					func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+						require.Equal(t, targeted, request.ListIDs,
+							"all %d distinct lists must reach the request, in the order the event named them", distinctCount)
+						return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+					})
+
+				output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+					FileName:        writeStagingFile(t, listTargetingLine(t, 1, targeted...)),
+					ImportingJobIDs: []int64{1},
+					Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+				})
+
+				require.Equal(t, []int64{1}, output.ImportingJobIDs)
+				require.Empty(t, output.AbortJobIDs)
+				require.Empty(t, output.FailedJobIDs)
+			})
+		}
+	})
+
+	t.Run("one distinct list past the bound is reported rather than truncated", func(t *testing.T) {
+		t.Parallel()
+
+		// NO upload expectation is registered on purpose. The only event in this batch cannot be
+		// targeted as it asked, so nothing may go on the wire at all, and gomock fails the case if a
+		// request is issued. A truncating implementation would upsert this contact onto the first
+		// supportedDistinctListIDs lists, omit the rest, and report success - a wrong delivery
+		// presented as a right one, which is precisely what must not happen.
+		api := newMockAPI(t)
+
+		output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+			FileName: writeStagingFile(t,
+				listTargetingLine(t, 1, distinctListIDs(supportedDistinctListIDs+1)...)),
+			ImportingJobIDs: []int64{1},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		// Terminal, like every other local rejection in this connector: the same event names the
+		// same lists on every retry, so retrying could only fail again.
+		require.Equal(t, []int64{1}, output.AbortJobIDs)
+		require.Equal(t, 1, output.AbortCount)
+		require.Contains(t, output.AbortReason, "more distinct sendgrid lists",
+			"the durable reason must name the actual cause, so the fix is contained in the failure")
+		require.Empty(t, output.ImportingJobIDs)
+		require.Nil(t, output.ImportingParameters)
+		require.Empty(t, output.FailedJobIDs)
+	})
+
+	t.Run("repeated list ids cannot displace a distinct one", func(t *testing.T) {
+		t.Parallel()
+
+		// THE REGRESSION CASE. The bound is charged against DISTINCT lists, so an event may repeat
+		// one list as often as it likes and the genuinely different list that follows still reaches
+		// the request. Charging the bound against RAW values instead - counting duplicates, then
+		// de-duplicating afterwards - stopped collecting among the repeats, normalized them down to
+		// one list, and upserted the contact onto that single list while silently dropping the
+		// target the event had actually added.
+		repeated := make([]string, 0, supportedDistinctListIDs+1)
+		for index := 0; index < supportedDistinctListIDs; index++ {
+			repeated = append(repeated, "list-a")
+		}
+		repeated = append(repeated, "list-b")
+
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+			func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				require.Equal(t, []string{"list-a", "list-b"}, request.ListIDs,
+					"a repeated list must cost the bound nothing, so the distinct list after it survives")
+				return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+			})
+
+		output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+			FileName:        writeStagingFile(t, listTargetingLine(t, 1, repeated...)),
+			ImportingJobIDs: []int64{1},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1}, output.ImportingJobIDs)
+		require.Empty(t, output.AbortJobIDs)
+	})
+
+	t.Run("duplicates across entries and shapes collapse in first appearance order", func(t *testing.T) {
+		t.Parallel()
+
+		// Several listIds entries, an array id and a scalar id, a blank member, a non-scalar member,
+		// an unrelated externalId type, and one list named three times across two entries. What
+		// reaches the wire is each distinct list exactly once, in the order the event first named it.
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+			func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				require.Equal(t, []string{"list-b", "list-a", "list-c"}, request.ListIDs)
+				return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+			})
+
+		output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+			FileName: writeStagingFile(t, stagingLine(t, 1,
+				`{"type":"identify","userId":"user_1","traits":{"email":"one@example.com"},`+
+					`"context":{"externalId":[`+
+					`{"type":"listIds","id":["list-b","  list-a  ","list-b","",{"nested":"x"}]},`+
+					`{"type":"userId","id":"ignored-by-type"},`+
+					`{"type":"LISTIDS","id":"list-c"},`+
+					`{"type":"listIds","id":"list-a"}]}}`)),
+			ImportingJobIDs: []int64{1},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1}, output.ImportingJobIDs)
+		require.Empty(t, output.AbortJobIDs)
+	})
+
+	t.Run("an over targeted event does not take its siblings down with it", func(t *testing.T) {
+		t.Parallel()
+
+		// The rejection is scoped to the record that carries it, exactly like an identifier-less
+		// contact or an over-long field: the sibling event, which targets a list normally, is still
+		// upserted in the same upload.
+		api := newMockAPI(t)
+		api.EXPECT().UploadContacts(gomock.Any()).Times(1).DoAndReturn(
+			func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				require.Len(t, request.Contacts, 1)
+				require.Equal(t, "one@example.com", request.Contacts[0].Email)
+				require.Equal(t, []string{"list-a"}, request.ListIDs)
+				return &sendgridbulkupload.UpsertResponse{JobID: "sg-1"}, nil
+			})
+
+		output := newUploader(api).Upload(&common.AsyncDestinationStruct{
+			FileName: writeStagingFile(t,
+				stagingLine(t, 1, `{"type":"identify","userId":"user_1","traits":{"email":"one@example.com"},`+
+					`"context":{"externalId":[{"type":"listIds","id":["list-a"]}]}}`),
+				listTargetingLine(t, 2, distinctListIDs(supportedDistinctListIDs+1)...)),
+			ImportingJobIDs: []int64{1, 2},
+			Destination:     testDestination(map[string]any{"apiKey": "SG.k"}),
+		})
+
+		require.Equal(t, []int64{1}, output.ImportingJobIDs)
+		require.Equal(t, []int64{2}, output.AbortJobIDs)
+		require.Contains(t, output.AbortReason, "more distinct sendgrid lists")
+		require.Empty(t, output.FailedJobIDs)
 	})
 }
 
@@ -2133,9 +2362,13 @@ func TestFullLifecycle(t *testing.T) {
 // persistedManifestBudget mirrors the connector's unexported maxImportManifestBytes.
 //
 // Mirrored rather than exported: the bound is an internal invariant, and widening the package's API
-// so a test can read it would be the test changing the thing it is meant to observe. The two are
-// kept in step by TestManifestBudgetMirrorIsAccurate, which lives in the internal test package
-// where the real constant is visible and fails if they ever drift apart.
+// so a test can read it would be the test changing the thing it is meant to observe.
+//
+// It is asserted as an UPPER BOUND on what Upload actually persists, which is the direction that
+// matters: if the connector's own ceiling were ever raised, or lost, the manifests measured below
+// would grow past this literal and these cases would fail. If it is ever deliberately TIGHTENED,
+// this literal must be lowered with it, or the assertion merely stops being the tightest statement
+// available rather than becoming wrong.
 const persistedManifestBudget = 1024
 
 func TestImportManifestPersistence(t *testing.T) {
@@ -2775,9 +3008,15 @@ func TestErrorsDocumentURLPolicy(t *testing.T) {
 			"the refusal must name the configuration key an operator has to set")
 	})
 
-	// The accepting side of the allow list - that SendGrid's own hosts pass it, so reconciliation is
-	// not stalled out of the box - is asserted in apiService_internal_test.go instead. Accepting a
-	// url here would mean dialing it, and a unit test must not open a socket to a real provider.
+	// The accepting side of the allow list - that SendGrid's own hosts pass it - is deliberately NOT
+	// asserted anywhere in this package, and the reason is a property of the assertion rather than an
+	// oversight: a url the policy ACCEPTS is a url the adapter then DIALS, and no test here opens a
+	// socket to a real provider. What is observable without one is asserted instead, in three places
+	// that together bound the policy from both sides: the shipped default is a populated, non-empty
+	// enumeration - errors_document_allowed_host_count is 2 in TestErrorsDocumentReadBudget, so an
+	// unconfigured destination is default-deny rather than stalled - the effective list tracks an
+	// operator override in TestErrorsDocumentHostAllowListOverride, and every host outside the list
+	// is refused HERE for being outside it rather than by some incidental transport rule.
 
 	t.Run("a lookalike host cannot pass for a sendgrid host", func(t *testing.T) {
 		t.Parallel()
@@ -2816,8 +3055,10 @@ const errorsURLAllowedHostsConfigKey = "errorsURLAllowedHosts"
 //
 //   - an override REPLACES the default list, so a SendGrid host the override omits is no longer
 //     accepted. Replacement rather than extension is what keeps the effective policy equal to the
-//     configured one. That an overridden host becomes ACCEPTED is asserted in
-//     apiService_internal_test.go, where it needs no socket.
+//     configured one. That an overridden host becomes ACCEPTED is not asserted directly, for the
+//     same reason the default's accepting side is not: acceptance is followed by a dial, and this
+//     suite opens no socket. The published host count below is the socket-free observation of the
+//     list actually in force.
 //   - an override that normalizes away to nothing - an empty string, blanks, bare dots - falls back
 //     to the DEFAULT list, never to "no list". Reading an emptied override as "allow every host"
 //     would let one configuration typo silently reopen the exact hole the default closes, which is
@@ -3450,7 +3691,7 @@ func TestGetUploadStatsDocumentRowLimits(t *testing.T) {
 			response := reconcileFixtureDocument(t, document)
 
 			require.Equal(t, http.StatusInternalServerError, response.StatusCode)
-			require.Contains(t, response.Error, "still allowed for this import")
+			require.Contains(t, response.Error, "still allowed for this upload")
 			require.Equal(t, common.EventStatMeta{}, response.Metadata)
 		})
 	}
@@ -3519,7 +3760,7 @@ func TestGetUploadStatsRowBudgetSpansEveryDocumentOfAnImport(t *testing.T) {
 		})
 
 		require.Equal(t, http.StatusInternalServerError, response.StatusCode)
-		require.Contains(t, response.Error, "still allowed for this import")
+		require.Contains(t, response.Error, "still allowed for this upload")
 		require.Empty(t, response.Metadata.SucceededKeys,
 			"nothing may be reported delivered once the evidence stopped being readable")
 	})
@@ -3575,7 +3816,7 @@ func TestGetUploadStatsRowBudgetChargesEveryEntryItReads(t *testing.T) {
 
 		require.Equal(t, http.StatusInternalServerError, response.StatusCode,
 			"entries the parser declined must be charged against the allowance, or this pair passes")
-		require.Contains(t, response.Error, "still allowed for this import")
+		require.Contains(t, response.Error, "still allowed for this upload")
 		require.Empty(t, response.Metadata.SucceededKeys,
 			"nothing may be reported delivered once the evidence stopped being readable")
 	})
@@ -3591,8 +3832,101 @@ func TestGetUploadStatsRowBudgetChargesEveryEntryItReads(t *testing.T) {
 		response := reconcileFixtureDocument(t, document)
 
 		require.Equal(t, http.StatusInternalServerError, response.StatusCode)
-		require.Contains(t, response.Error, "still allowed for this import")
+		require.Contains(t, response.Error, "still allowed for this upload")
 		require.Equal(t, common.EventStatMeta{}, response.Metadata)
+	})
+}
+
+// TestGetUploadStatsRowAllowanceScalesWithTheUpload pins that the allowance an upload's errors
+// documents share is DERIVED from the number of contacts that upload sent, not a flat literal.
+//
+// This is the regression guard for a stall, and the stall is the whole point of the case. One upload
+// may create many imports of up to 30,000 contacts each, so it can legitimately carry far more
+// contacts than the allowance's floor - and if SendGrid rejects them, a truthful set of errors
+// documents holds a row for every one. Against a flat allowance that upload becomes a document the
+// connector refuses to finish reading, and a refusal here does not merely lose information: the
+// batch router writes NO job status at all for a non-200 from GetUploadStats and its poll route has
+// no retry budget that could escalate, so every job of the upload would stay importing forever and
+// the destination would stop accepting new work. Deriving the allowance from the importing list is
+// what makes that unreachable, because SendGrid cannot report an errored contact it was never sent.
+//
+// The two bounds that survive the derivation are pinned here as well, because a fix that removed
+// them instead of scaling one of them would look identical in the first case and be a regression:
+// the derived allowance is still a bound, and no single document may still be read into more rows
+// than the connector will hold at one time.
+//
+// The subtests run SEQUENTIALLY on purpose. They share one deliberately large importing list, and
+// running them one at a time keeps this case's peak memory at a single reconciliation's worth
+// however the suite happens to be shuffled.
+func TestGetUploadStatsRowAllowanceScalesWithTheUpload(t *testing.T) {
+	t.Parallel()
+
+	// Four contacts past the floor, so only an allowance derived from the upload can cover the pair
+	// of documents below, and an even count so the pair divides exactly.
+	const importingJobCount = 100_004
+	// Half the allowance each: either document is comfortably inside the per-document ceiling, and
+	// together they come to exactly one row per importing job.
+	const rowsPerDocument = importingJobCount / 2
+
+	// Built once. Materializing an upload this size is the only expensive thing here, and nothing
+	// below mutates it.
+	jobs := syntheticImportingJobs(t, importingJobCount)
+	secondErrorsURL := testErrorsURL + "-2"
+	// Every row names the first job's contact, so attribution is unambiguous and the case is about
+	// the allowance rather than about matching: job 1 is rejected and every other job succeeds by
+	// exclusion.
+	firstDocument := errorsDocumentNaming(firstSyntheticContact, rowsPerDocument)
+
+	t.Run("documents summing to one row per importing job are read in full", func(t *testing.T) {
+		api := newMockAPI(t)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return([]byte(firstDocument), nil)
+		api.EXPECT().GetImportErrors(secondErrorsURL).Times(1).Return([]byte(firstDocument), nil)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: testErrorsURL + "\n" + secondErrorsURL,
+			ImportingList:       jobs,
+		})
+
+		require.Equal(t, http.StatusOK, response.StatusCode,
+			"an upload larger than the floor must still be reconcilable, or its jobs stay importing forever")
+		require.Empty(t, response.Error)
+		require.Equal(t, []int64{1}, response.Metadata.FailedKeys)
+		require.Len(t, response.Metadata.SucceededKeys, importingJobCount-1,
+			"every contact no row named must be reported delivered")
+		require.Empty(t, response.Metadata.AbortedKeys)
+	})
+
+	t.Run("one row past the derived allowance is still refused", func(t *testing.T) {
+		api := newMockAPI(t)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return([]byte(firstDocument), nil)
+		api.EXPECT().GetImportErrors(secondErrorsURL).Times(1).
+			Return([]byte(errorsDocumentNaming(firstSyntheticContact, rowsPerDocument+1)), nil)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: testErrorsURL + "\n" + secondErrorsURL,
+			ImportingList:       jobs,
+		})
+
+		require.Equal(t, http.StatusInternalServerError, response.StatusCode,
+			"the derived allowance is a bound, not the removal of one")
+		require.Contains(t, response.Error, "still allowed for this upload")
+		require.Empty(t, response.Metadata.SucceededKeys,
+			"nothing may be reported delivered once the evidence stopped being readable")
+	})
+
+	t.Run("one document may still not exceed the per document ceiling", func(t *testing.T) {
+		api := newMockAPI(t)
+		api.EXPECT().GetImportErrors(testErrorsURL).Times(1).
+			Return([]byte(errorsDocumentNaming(firstSyntheticContact, 100_001)), nil)
+
+		response := newUploader(api).GetUploadStats(common.GetUploadStatsInput{
+			FailedJobParameters: testErrorsURL,
+			ImportingList:       jobs,
+		})
+
+		require.Equal(t, http.StatusInternalServerError, response.StatusCode,
+			"peak memory is bounded per document, so a larger upload may not enlarge one document's reading")
+		require.Contains(t, response.Error, "still allowed for this upload")
 	})
 }
 

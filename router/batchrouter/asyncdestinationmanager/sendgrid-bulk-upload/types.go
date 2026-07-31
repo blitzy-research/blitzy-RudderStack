@@ -450,9 +450,23 @@ type SendGridAPIService interface {
 // onto the originating jobs.
 //
 // Every field is exported for two concrete reasons. The package's tests live in an external
-// test package and build the uploader as a literal, and the two caps have to be shrinkable
-// so that chunking boundaries can be exercised without materializing tens of thousands of
-// contacts.
+// test package and build the uploader as a literal, and the four bounds below have to be
+// overrideable per instance so that each can be exercised at its boundary without
+// materializing the production-sized input it would otherwise take:
+//
+//   - MaxContactsPerRequest and MaxRequestBytes are the two request caps. Shrinking them is
+//     what lets the chunker's element and byte boundaries be pinned without building tens of
+//     thousands of contacts or a six-megabyte staging file.
+//   - MaxBufferCapacity is the staging-file line limit. Shrinking it is the only way to
+//     exercise a line the scanner cannot read, which is a distinct failure from a contact the
+//     chunker refuses and has to be provable as such.
+//   - MaxImportsPerUpload is the poll budget an upload spends. Shrinking it is what lets the
+//     deferral of surplus chunks be observed in a few requests rather than in hundreds.
+//
+// Each is a plain int whose zero value selects the production default, so a literal that sets
+// none of them behaves exactly as the constructor-built manager does. Every one of them is
+// resolved through an accessor that validates and clamps it, so an override - or a configured
+// value - outside the supported range cannot reach the code that spends it.
 //
 // The struct deliberately holds NO per-upload or cross-invocation state. Upload statistics
 // may be reconciled in a different process invocation, or on a different pod, from the
