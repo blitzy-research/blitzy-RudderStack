@@ -19,15 +19,12 @@ import (
 	"github.com/rudderlabs/rudder-go-kit/stats"
 )
 
-// The SendGrid Marketing Contacts endpoints this connector uses, and nothing else: an upsert, an
-// import status read, and an authenticated fetch of the errors document an import publishes.
 const (
 	sendGridBaseURL    = "https://api.sendgrid.com"
 	contactsPath       = "/v3/marketing/contacts"
 	contactImportsPath = "/v3/marketing/contacts/imports/"
 )
 
-// HTTP client tuning, following the repository's tuned-client convention.
 const (
 	defaultTimeout             = 30 * time.Second
 	defaultIdleConnTimeout     = 90 * time.Second
@@ -63,17 +60,14 @@ const (
 	// rather than to enforce a shape.
 	maxErrorsURLLength = 2048
 
-	// maxErrorsURLRedirects bounds how many hops the errors document fetch follows.
 	maxErrorsURLRedirects = 5
 
-	// maxImportJobIDLength bounds the import identifier accepted into a URL path. SendGrid issues
-	// UUID-shaped identifiers, so this is ample.
+	// maxImportJobIDLength bounds untrusted path input while leaving ample room for provider-issued
+	// identifiers.
 	maxImportJobIDLength = 256
 
-	// maxAPIErrorItems bounds how many entries of an error body are retained for counting.
 	maxAPIErrorItems = 64
 
-	// maxRetryAfterSeconds bounds the Retry-After hint this adapter is willing to repeat.
 	maxRetryAfterSeconds = 86400
 )
 
@@ -149,7 +143,7 @@ func newTransport() *http.Transport {
 		MaxIdleConns:        defaultMaxConnsPerHost,
 		MaxIdleConnsPerHost: defaultMaxIdleConnsPerHost,
 		IdleConnTimeout:     defaultIdleConnTimeout,
-		// Disable compression to prevent BREACH attacks
+		// Do not advertise automatic gzip support.
 		DisableCompression: true,
 	}
 }
@@ -269,8 +263,6 @@ func isPubliclyRoutableAddr(addr netip.Addr) bool {
 	return true
 }
 
-// setRequestHeaders applies the static bearer credential SendGrid authenticates with, plus the
-// content type the upsert requires.
 func setRequestHeaders(req *http.Request, apiKey string, hasBody bool) {
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")

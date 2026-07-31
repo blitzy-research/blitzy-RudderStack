@@ -12,22 +12,11 @@ import (
 )
 
 const (
-	// destName is the single source of truth for this connector's destination-definition name.
-	// The same literal is registered in three places outside this package - the batch destination
-	// catalogue the processor consults, the async destination list the batch router classifies
-	// against, and the async destination manager factory switch - and all three compare it as a
-	// plain string, so a typo produces neither a compile error nor a test failure: the destination
-	// would simply never be routed. It is therefore never written inline as a stats tag or a log
-	// field; every such site reads this constant.
-	//
-	// This is deliberately NOT the pre-existing "SENDGRID" cloud destination, which is delivered
-	// synchronously by the regular router and is untouched by this connector.
+	// destName identifies this connector in logs, metrics, and destination-scoped configuration; it
+	// is distinct from the synchronous SENDGRID destination.
 	destName = "SENDGRID_BULK_UPLOAD"
 )
 
-// DestinationConfig is the typed view of this connector's destination configuration as delivered by
-// the control plane. It is populated by round-tripping the untyped config map through
-// jsonrs.Marshal followed by jsonrs.Unmarshal, so plain JSON tags are all it needs.
 type DestinationConfig struct {
 	// APIKey is the SendGrid API key presented as a static bearer credential on every request. It
 	// is mandatory: a destination without it cannot do useful work, so manager construction fails
@@ -48,16 +37,10 @@ type DestinationConfig struct {
 	CustomFieldsMapping map[string]string `json:"customFieldsMapping"`
 }
 
-// Contact is one contact object of the SendGrid Marketing Contacts upsert request body.
-//
-// SendGrid upserts contacts: a field omitted from the request keeps the value already stored,
-// whereas a field sent empty OVERWRITES it. Every field therefore carries omitempty, so a trait
-// missing from a RudderStack event can never silently erase data held in SendGrid.
-//
-// A contact must carry at least one of Email, PhoneNumberID, ExternalID or AnonymousID. Email is
-// the primary identifier and SendGrid lower-cases it on ingestion, which is what allows an import's
-// errors to be reconciled against the jobs that produced it without keeping any state between
-// calls.
+// Contact is one Marketing Contacts upsert item. Omitted fields must stay omitted because SendGrid
+// preserves them, while fields sent empty overwrite stored values. At least one of Email,
+// PhoneNumberID, ExternalID, or AnonymousID must be present. Email is normalized to lower case so
+// provider error rows and importing jobs compare consistently.
 type Contact struct {
 	Email               string         `json:"email,omitempty"`
 	PhoneNumberID       string         `json:"phone_number_id,omitempty"`
@@ -90,21 +73,17 @@ type UpsertResponse struct {
 	JobID string `json:"job_id"`
 }
 
-// ImportStatusResponse is the body of GET /v3/marketing/contacts/imports/{id}.
-//
-// The counts and the errors document URL live inside a NESTED results object. A flat struct would
-// compile and unmarshal without error while reading errored_count as 0 forever, which would report
-// every partial failure as a clean success - the single highest-risk detail in this connector.
+// ImportStatusResponse models GET /v3/marketing/contacts/imports/{id}. Results must remain nested;
+// flattening it silently leaves errored_count at zero and can turn partial failures into success.
 type ImportStatusResponse struct {
 	ID         string        `json:"id"`
 	Status     string        `json:"status"`
 	JobType    string        `json:"job_type"`
-	Results    ImportResults `json:"results"` // MUST stay nested
+	Results    ImportResults `json:"results"`
 	StartedAt  string        `json:"started_at"`
 	FinishedAt string        `json:"finished_at"`
 }
 
-// ImportResults is the nested results object of an import status response.
 type ImportResults struct {
 	RequestedCount int    `json:"requested_count"`
 	CreatedCount   int    `json:"created_count"`
@@ -152,9 +131,7 @@ type APIErrorItem struct {
 // many error items the documented body carried. That is enough for an operator to act on and safe to
 // place in a JobsDB failure reason, which is where these strings ultimately land.
 type APIError struct {
-	// Operation names the SendGrid call, using this package's own vocabulary.
-	Operation string
-	// StatusCode is the HTTP status the response carried.
+	Operation  string
 	StatusCode int
 	// Items are the decoded entries of the documented error body, retained for their count and for
 	// shape fidelity only.
@@ -173,7 +150,6 @@ func (e *APIError) Error() string {
 // of the terminal one. Everything it renders is connector-owned and numeric, so it is safe to
 // persist as a failure reason.
 type RateLimitError struct {
-	// StatusCode is the status that produced this error, always 429.
 	StatusCode int
 	// RetryAfter is the Retry-After hint, normalized to a canonical duration such as "30s", or
 	// empty. The header is not documented for the SendGrid v3 API - it may be injected by an edge or
@@ -212,11 +188,8 @@ func (e *RateLimitError) Error() string {
 		e.StatusCode, strings.Join(details, ", "))
 }
 
-// SendGridAPIService is the mockable seam over the three - and only three - SendGrid REST
-// operations this connector performs. Every test scenario is expressible through expectations on
-// these methods, so the suite needs no network access at all.
-//
-// None of the pointer-returning methods ever returns a nil value with a nil error.
+// SendGridAPIService abstracts the three provider calls used by the manager. Pointer-returning
+// methods return either a non-nil response or a non-nil error.
 type SendGridAPIService interface {
 	// UploadContacts issues PUT /v3/marketing/contacts and treats only 202 Accepted as success.
 	UploadContacts(request UpsertRequest) (*UpsertResponse, error)

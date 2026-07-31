@@ -24,8 +24,6 @@ import (
 	"github.com/rudderlabs/rudder-server/router/batchrouter/asyncdestinationmanager/common"
 )
 
-// batchRouterModule is the module tag every metric this connector emits carries, matching the batch
-// router's own module name.
 const batchRouterModule = "batch_router"
 
 // Request caps for PUT /v3/marketing/contacts. SendGrid accepts at most 30,000 contacts OR 6 MB per
@@ -39,27 +37,17 @@ const (
 	configKeyMaxContactsPerRequest = "maxContactsPerRequest"
 	configKeyMaxRequestBytes       = "maxRequestBytes"
 
-	// Floors applied to OPERATOR-CONFIGURED values only. A configured value below these is treated
-	// as a mistake and the documented default is used instead, so a typo cannot leave a destination
-	// unable to send anything. The instance fields, which exist so tests can exercise chunk
-	// boundaries without materializing tens of thousands of contacts, are honoured as given.
+	// Floors apply only to configured values; explicit instance overrides are clamped only to
+	// provider maxima.
 	minConfiguredContactsPerRequest = 1
 	minConfiguredRequestBytes       = 1024
 )
 
-// maxStagingLineBytes bounds one line of the staging file, and therefore the largest staged record
-// this connector will even look at. It sits far above any contact this connector would accept - the
-// field bounds below cap a contact well under a megabyte - so a line beyond it is not a contact.
+// maxStagingLineBytes bounds scanner memory for a single staged record.
 const maxStagingLineBytes = 8 << 20
 
-// Bounds applied to the reserved contact fields before they go on the wire.
-//
-// These are this connector's own bounds, not a transcription of the provider's schema: each is set
-// generously, at or beyond the widest value a real contact field plausibly holds, and its purpose is
-// narrow - stop a value that is obviously not a contact field, such as a whole serialized document
-// where a city name belonged, from being sent in a request carrying up to 30,000 other contacts that
-// SendGrid would then refuse wholesale. maxEmailRunes is the one bound taken from a specification:
-// 254 is the longest address an SMTP path may carry (RFC 5321).
+// Connector-local field bounds prevent one malformed value from causing SendGrid to reject a large
+// batch; they are not provider schema limits.
 const (
 	maxEmailRunes             = 254
 	maxPhoneNumberRunes       = 100
@@ -75,8 +63,7 @@ const (
 // Bounds applied while the errors document is parsed. The adapter already bounds how many BYTES are
 // read; these bound what the parser is willing to build out of them.
 const (
-	// maxErrorRowsPerDocument sits at twice the contacts one request can carry, so only a document
-	// that does not describe a single import can reach it.
+	// maxErrorRowsPerDocument bounds parser work independently of the errors document's byte limit.
 	maxErrorRowsPerDocument = 2 * defaultMaxContactsPerRequest
 	// maxErrorRowMessageRunes bounds how much of a row's message is examined when deriving its error
 	// class. The message itself is never stored.
@@ -168,20 +155,9 @@ var safeImportStatusToken = regexp.MustCompile(`^[a-z0-9_]{1,32}$`)
 // anything is known about its outcome.
 var _ common.AsyncDestinationManager = (*SendGridBulkUploader)(nil)
 
-// NewManager builds the manager for one SendGrid destination.
-//
-// The three-argument signature is fixed by the async destination manager factory. SendGrid needs
-// neither application configuration nor the backend-config client, and no OAuth subsystem either:
-// the Marketing Contacts API authenticates with a single static bearer credential taken from the
-// destination's own configuration.
-//
-// Construction FAILS rather than returning a half-configured manager - in particular a destination
-// with no API key, or with an ambiguous custom-field mapping, is rejected here, once and clearly,
-// instead of failing every batch later. Observability, by contrast, is defaulted: a nil logger or
-// stats factory falls back to the no-op implementation.
-//
-// The request caps are resolved lazily by maxContactsPerRequest and maxRequestBytes, which is the
-// single place their normalization lives.
+// NewManager validates destination configuration before constructing the adapter. Missing
+// credentials or ambiguous custom-field mappings fail fast; nil observability dependencies use
+// no-op implementations.
 func NewManager(log logger.Logger, statsFactory stats.Stats, destination *backendconfig.DestinationT) (*SendGridBulkUploader, error) {
 	if destination == nil {
 		return nil, errors.New("the sendgrid destination is nil")
@@ -244,14 +220,8 @@ func parseDestinationConfig(destination *backendconfig.DestinationT) (Destinatio
 	return destinationConfig, nil
 }
 
-// validateCustomFieldsMapping normalizes the trait-to-custom-field mapping and rejects a mapping
-// that cannot work.
-//
-// A blank trait name or field ID would have SendGrid refuse every contact in every batch, and two
-// traits claiming one field ID would resolve by Go's randomized map iteration order - delivering a
-// different value on each run while looking perfectly healthy. Both are therefore construction
-// failures rather than per-batch surprises.
-// The normalized mapping is always non-nil, so callers only ever test its length.
+// validateCustomFieldsMapping trims entries and rejects blank names/IDs or duplicate field IDs.
+// Duplicate IDs would make the selected value depend on map iteration order.
 func validateCustomFieldsMapping(mapping map[string]string) (map[string]string, error) {
 	if len(mapping) == 0 {
 		return map[string]string{}, nil
@@ -281,11 +251,8 @@ func validateCustomFieldsMapping(mapping map[string]string) (map[string]string, 
 	return normalized, nil
 }
 
-// normalizeListIDs trims, de-duplicates and bounds a set of SendGrid list identifiers, whatever their
-// source. Both sources - destination configuration and per-event targeting - go through it, so one
-// rule governs both.
-// The normalized set is always non-nil, so callers only ever test its length; an empty set is
-// legitimate, because SendGrid accepts an upsert that targets no list at all.
+// normalizeListIDs returns a non-nil slice; an empty set is valid because SendGrid accepts upserts
+// without list targeting.
 func normalizeListIDs(listIDs []string) ([]string, error) {
 	if len(listIDs) == 0 {
 		return []string{}, nil
@@ -347,7 +314,6 @@ func (b *SendGridBulkUploader) maxContactsPerRequest() int {
 	return configured
 }
 
-// maxRequestBytes resolves the byte cap for the WHOLE request body, envelope included.
 func (b *SendGridBulkUploader) maxRequestBytes() int {
 	if b.MaxRequestBytes > 0 {
 		return min(b.MaxRequestBytes, defaultMaxRequestBytes)
@@ -399,20 +365,8 @@ func (f *contactFields) scalar(value gjson.Result, maxRunes int) string {
 	return text
 }
 
-// buildContact reduces one staged event to one SendGrid contact.
-//
-// The mapping below is exactly the one this repository documents for the SendGrid destination,
-// including the alternative trait spellings it names: traits.firstName or traits.first_name,
-// traits.address.street or traits.address_line_1, traits.address.city or traits.city, and
-// traits.alternateEmails or traits.alternate_emails. address_line_2 has no documented nested spelling,
-// so its only source is the trait of the same name. The nested form wins when both are present.
-//
-// The email is lower-cased because SendGrid lower-cases it anyway, and because reconciliation later
-// keys on it. A trait resolving to an object or an array is a rejection rather than something to
-// flatten, and every value is length-bounded.
-//
-// Nothing here inspects the event type: a track and an identify both reduce to a contact through the
-// same mapping, which is what makes the connector event-type agnostic.
+// buildContact applies the documented reserved-field aliases. Nested address values take precedence,
+// email is lowercased for provider/reconciliation consistency, and mapping is event-type agnostic.
 func (b *SendGridBulkUploader) buildContact(message gjson.Result) (Contact, error) {
 	traits := message.Get("traits")
 	address := traits.Get("address")
@@ -507,12 +461,9 @@ func (b *SendGridBulkUploader) resolveListIDs(message gjson.Result) ([]string, e
 			return listIDs, nil
 		}
 	}
-	// Already normalized during construction.
 	return b.DestinationConfig.ListIDs, nil
 }
 
-// firstPresent returns the first of the named keys that the parent object actually carries, so a
-// documented alternative spelling costs one lookup rather than a branch at every call site.
 func firstPresent(parent gjson.Result, keys ...string) gjson.Result {
 	for _, key := range keys {
 		if value := parent.Get(key); value.Exists() {
@@ -522,8 +473,6 @@ func firstPresent(parent gjson.Result, keys ...string) gjson.Result {
 	return gjson.Result{}
 }
 
-// coalesce returns the first value that exists, for the documented mappings whose alternative
-// spellings sit under different parents.
 func coalesce(values ...gjson.Result) gjson.Result {
 	for _, value := range values {
 		if value.Exists() {
@@ -609,15 +558,12 @@ type contactGroup struct {
 	sizes    []int
 }
 
-// contactChunk is one request's worth of contacts: within both caps and sharing one list target.
 type contactChunk struct {
 	listIDs  []string
 	contacts []Contact
 	jobIDs   []int64
 }
 
-// stagedContacts is the outcome of reading one staging file: the deliverable contacts, grouped, plus
-// the records that were refused locally, each with the reason it was refused.
 type stagedContacts struct {
 	groups []*contactGroup
 	index  map[string]int
@@ -704,10 +650,8 @@ func parseStagingLine(line []byte) (int64, gjson.Result, error) {
 	return jobID.Int(), message, nil
 }
 
-// readStagedContacts turns the staging file into deliverable, grouped contacts.
-//
-// Every failure is isolated to the record that caused it: one unusable event does not stop the
-// batch, and its job is reported with the reason it was refused rather than being dropped.
+// readStagedContacts isolates attributable record errors; file/scan failures and lines without a job
+// ID fail the batch because no real job can be named safely.
 func (b *SendGridBulkUploader) readStagedContacts(filePath string, statLabels stats.Tags) (*stagedContacts, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -740,8 +684,6 @@ func (b *SendGridBulkUploader) readStagedContacts(filePath string, statLabels st
 			staged.abort(jobID, contactRejectionReason(err))
 			continue
 		}
-		// Targeting is resolved before the contact is serialized: a record whose targeting cannot be
-		// honoured is not going to be sent, so sizing it would be work done for a discarded value.
 		listIDs, err := b.resolveListIDs(message)
 		if err != nil {
 			staged.abort(jobID, contactRejectionReason(err))
@@ -787,7 +729,6 @@ func contactRejectionReason(err error) string {
 	return reasonMalformedStagedEvent
 }
 
-// chunkPlan is the set of requests one staging file reduces to, plus the records no request can carry.
 type chunkPlan struct {
 	chunks []contactChunk
 	// oversizedJobIDs are contacts larger than one whole request's budget: permanent.
@@ -874,7 +815,8 @@ func chunkBySizeAndElements(contacts []Contact, jobIDs []int64, sizes []int, max
 		chunkSize = 0
 	}
 	for index := range contacts {
-		// One byte for the comma that separates this contact from its neighbour.
+		// Reserve one separator byte per contact; the first contact in each chunk is conservatively
+		// over-counted by one byte.
 		contactSize := sizes[index] + 1
 		if contactSize > maxBytes {
 			oversized = append(oversized, jobIDs[index])
@@ -891,8 +833,6 @@ func chunkBySizeAndElements(contacts []Contact, jobIDs []int64, sizes []int, max
 	return contactChunks, jobIDChunks, oversized
 }
 
-// uploadOutcome accumulates what one Upload has to report, before it is reduced to the framework's
-// single-reason output shape.
 type uploadOutcome struct {
 	importingJobIDs  []int64
 	importParameters []byte
@@ -1286,7 +1226,8 @@ func (b *SendGridBulkUploader) buildImportingIndex(importingList []*jobsdb.JobT)
 		}
 		contact, err := b.buildContact(stagedMessage(job.EventPayload))
 		if err != nil {
-			// A job whose contact cannot be rebuilt was never sent, so no row can name it either.
+			// A contact that cannot be rebuilt cannot be indexed for reconciliation; skip it rather
+			// than inventing an identifier.
 			continue
 		}
 		for _, identifier := range identifiersOf(contact) {
@@ -1300,8 +1241,6 @@ func (b *SendGridBulkUploader) buildImportingIndex(importingList []*jobsdb.JobT)
 	return index
 }
 
-// identifiersOf lists the identifiers a contact could be named by in an errors document, matching the
-// identifier keys the tolerant parser reads.
 func identifiersOf(contact Contact) []string {
 	identifiers := make([]string, 0, 4)
 	for _, identifier := range []string{contact.Email, contact.ExternalID, contact.AnonymousID, contact.PhoneNumberID} {
@@ -1335,14 +1274,9 @@ func stagedMessage(payload []byte) gjson.Result {
 	return gjson.ParseBytes(payload)
 }
 
-// parseImportErrorRows reads the errors document in whichever of four shapes it arrived as: a bare
-// JSON array, an object wrapping the rows under "errors", an object wrapping them under "results",
-// or newline-delimited JSON.
-//
-// The tolerance is not decoration: that document's schema is genuinely undocumented, so binding to
-// one shape would mean silently reconciling nothing the day the provider changed it. Rows are read
-// through gjson's streaming iteration and bounded in number, so a large document cannot be
-// materialized whole.
+// parseImportErrorRows accepts a bare array, errors/results wrapper, or NDJSON because the provider
+// does not publish the document schema. The adapter already bounds total bytes; this function also
+// bounds the number of row structs it materializes.
 func parseImportErrorRows(document []byte) ([]ImportErrorRow, error) {
 	trimmed := bytes.TrimSpace(document)
 	if len(trimmed) == 0 {
@@ -1410,8 +1344,6 @@ func newlineDelimitedRows(document []byte) ([]ImportErrorRow, error) {
 	return rows, nil
 }
 
-// importErrorRowFrom reduces one document entry to an identifier and a message, taking each from the
-// first candidate key the entry carries.
 func importErrorRowFrom(entry gjson.Result) (ImportErrorRow, bool) {
 	if !entry.IsObject() {
 		return ImportErrorRow{}, false

@@ -53,12 +53,8 @@ var stagedEmails = map[int64]string{
 	5: "erin@example.com",
 }
 
-// stagedJobIDs are the job IDs of the committed staging fixture, in file order.
 func stagedJobIDs() []int64 { return []int64{1, 2, 3, 4, 5} }
 
-// newUploader assembles the manager directly, which is what the external test package exists for:
-// the generated API-service mock is injected in place of the HTTP adapter, so the whole suite runs
-// with no network access at all.
 func newUploader(t *testing.T, apiService sendgridbulkupload.SendGridAPIService, listIDs ...string) *sendgridbulkupload.SendGridBulkUploader {
 	t.Helper()
 	return &sendgridbulkupload.SendGridBulkUploader{
@@ -90,7 +86,6 @@ func asyncDestination(fileName string, jobIDs []int64) *common.AsyncDestinationS
 	}
 }
 
-// stagedMessages returns the event of every record of the committed staging fixture, keyed by job ID.
 func stagedMessages(t *testing.T) map[int64]string {
 	t.Helper()
 	contents, err := os.ReadFile(stagingFixturePath)
@@ -127,8 +122,6 @@ func importingJob(jobID int64, message string) *jobsdb.JobT {
 	return &jobsdb.JobT{JobID: jobID, EventPayload: []byte(`{"body":{"JSON":` + message + `}}`)}
 }
 
-// writeStagingFile stages lines into a temporary file, for the cases the committed fixture
-// deliberately does not cover.
 func writeStagingFile(t *testing.T, lines ...string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "uploadData.jsonl")
@@ -196,13 +189,10 @@ func TestNewManager(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, manager)
 
-		// The registered destination must be constructible through the shared contract, since that is
-		// how the batch router holds it.
 		var contract common.AsyncDestinationManager = manager
 		require.NotNil(t, contract)
 
 		require.Equal(t, testAPIKey, manager.DestinationConfig.APIKey)
-		// Trimmed, de-duplicated, and blanks dropped.
 		require.Equal(t, []string{testConfigListID}, manager.DestinationConfig.ListIDs)
 		require.Equal(t, map[string]string{"plan": "w1", "signedUpAt": "w2"}, manager.DestinationConfig.CustomFieldsMapping)
 	})
@@ -282,7 +272,6 @@ func TestTransform(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 			uploader := newUploader(t, newAPIServiceMock(t), testEventListID)
-			// The router hands Transform the original job payload, whose event sits under body.JSON.
 			job := importingJob(testCase.jobID, messages[testCase.jobID])
 
 			staged, err := uploader.Transform(job)
@@ -300,9 +289,6 @@ func TestTransform(t *testing.T) {
 	}
 }
 
-// TestUploadHappyPath is scenario S1: N staged track/identify events become ONE PUT carrying the
-// correct contact fields and list IDs, SendGrid accepts it with a job ID, and that job ID is
-// persisted in the shape the router reads back.
 func TestUploadHappyPath(t *testing.T) {
 	t.Parallel()
 
@@ -322,9 +308,6 @@ func TestUploadHappyPath(t *testing.T) {
 	require.Equal(t, []string{testEventListID}, captured.ListIDs)
 	require.Len(t, captured.Contacts, 5)
 
-	// A fully populated identify: every documented mapping, with the email lower-cased, userId as
-	// external_id, anonymousId as anonymous_id, the nested address traits flattened, and only the
-	// explicitly mapped traits as custom fields - addressed by their pre-created field IDs.
 	require.Equal(t, sendgridbulkupload.Contact{
 		Email:               "alex@example.com",
 		PhoneNumberID:       "+14155551234",
@@ -340,8 +323,6 @@ func TestUploadHappyPath(t *testing.T) {
 		CustomFields:        map[string]any{"w1": "enterprise", "w2": "2026-01-15"},
 	}, contactByEmail(t, captured.Contacts, "alex@example.com"))
 
-	// A track event reduces to a contact through the same mapping, which is what makes the connector
-	// event-type agnostic.
 	blake := contactByEmail(t, captured.Contacts, "blake@example.com")
 	require.Equal(t, "user_223", blake.ExternalID)
 	require.Equal(t, "Portland", blake.City)
@@ -380,7 +361,6 @@ func TestUploadHappyPath(t *testing.T) {
 	require.Equal(t, testImportJobID, parameters.ImportId)
 	require.Equal(t, 5, parameters.ImportCount)
 
-	// And the import it produced polls to a clean completion.
 	apiService.EXPECT().GetImportStatus(testImportJobID).Times(1).
 		Return(&sendgridbulkupload.ImportStatusResponse{
 			ID:      testImportJobID,
@@ -391,9 +371,6 @@ func TestUploadHappyPath(t *testing.T) {
 	require.Equal(t, common.PollStatusResponse{StatusCode: http.StatusOK, Complete: true}, poll)
 }
 
-// TestUploadRateLimited is scenario S3: a 429 must leave every affected job on the RETRYABLE channel
-// and must not leave any importing state behind, so the batch router releases the batch and tries
-// again instead of stranding the destination.
 func TestUploadRateLimited(t *testing.T) {
 	t.Parallel()
 
@@ -412,7 +389,6 @@ func TestUploadRateLimited(t *testing.T) {
 	uploader.SendGridAPIService = apiService
 	output := uploader.Upload(asyncDestination(stagingFixturePath, stagedJobIDs()))
 
-	// Retryable, and ONLY retryable.
 	require.ElementsMatch(t, stagedJobIDs(), output.FailedJobIDs)
 	require.Equal(t, 5, output.FailedCount)
 	require.Empty(t, output.AbortJobIDs, "a rate limit is transient, so nothing may be aborted")
@@ -602,9 +578,6 @@ func TestUploadRejectionsAndFailures(t *testing.T) {
 	})
 }
 
-// TestUploadListTargetingAndDeferral proves the documented list-targeting precedence and the
-// consequence of it: contacts aimed at different lists cannot share a request, and only ONE import
-// can be persisted per upload, so the rest of the batch is deferred RETRYABLY rather than lost.
 func TestUploadListTargetingAndDeferral(t *testing.T) {
 	t.Parallel()
 
@@ -686,7 +659,6 @@ func TestUploadChunkBoundaries(t *testing.T) {
 				require.Equal(t, testCase.expectedImports, output.ImportingJobIDs)
 				require.Equal(t, testCase.expectedDeferred, nilIfEmpty(output.FailedJobIDs))
 				require.Empty(t, output.AbortJobIDs)
-				// Never an empty chunk, and never a chunk over the cap.
 				require.NotEmpty(t, captured.Contacts)
 				require.LessOrEqual(t, len(captured.Contacts), testCase.maxContacts)
 			})
@@ -1236,9 +1208,8 @@ func TestGetUploadStatsRetriesRatherThanReportingFalseSuccess(t *testing.T) {
 	})
 }
 
-// errorsDocumentFixture is the COMMITTED partial-failure document. It is the oracle for scenario S2:
-// two of its rows name contacts the staging fixture carries - one under a flat email, one under a
-// nested contact.email - and its third names a contact this import never carried.
+// errorsDocumentFixture contains two attributable rows (flat and nested email) plus one unmatched
+// row.
 func errorsDocumentFixture(t *testing.T) []byte {
 	t.Helper()
 	document, err := os.ReadFile(errorsFixturePath)
@@ -1246,15 +1217,8 @@ func errorsDocumentFixture(t *testing.T) []byte {
 	return document
 }
 
-// TestUploadPartialFailureAcceptance is scenario S2, driven end to end by the committed fixtures: an
-// import finishes with some errors, the connector fetches and parses the errors document, and one
-// import yields BOTH outcomes - the errored contacts retryably failed with reasons, and the exact
-// remainder succeeded.
-//
-// Both statuses that can carry errored rows are exercised. The provider documents completed as
-// "finished without any errors", so a completed status with a non-zero nested errored_count
-// contradicts itself; reconciling anyway is what stops a partially errored import from being
-// reported as a clean success.
+// TestUploadPartialFailureAcceptance verifies both "errored" and defensive "completed with
+// errored_count > 0" statuses reconcile instead of succeeding wholesale.
 func TestUploadPartialFailureAcceptance(t *testing.T) {
 	t.Parallel()
 
@@ -1278,10 +1242,8 @@ func TestUploadPartialFailureAcceptance(t *testing.T) {
 					Results: sendgridbulkupload.ImportResults{
 						RequestedCount: 5,
 						UpdatedCount:   3,
-						// Nested, which is the whole point: read flat, this would be 0 forever and every
-						// partial failure would be reported as a clean success.
-						ErroredCount: 2,
-						ErrorsURL:    testErrorsURL,
+						ErroredCount:   2,
+						ErrorsURL:      testErrorsURL,
 					},
 				}, nil)
 			apiService.EXPECT().GetImportErrors(testErrorsURL).Times(1).
@@ -1314,7 +1276,6 @@ func TestUploadPartialFailureAcceptance(t *testing.T) {
 			require.Equal(t, http.StatusOK, response.StatusCode)
 			require.Empty(t, response.Error)
 
-			// The two attributable rows of the committed fixture, and only those.
 			require.Equal(t, []int64{2, 4}, response.Metadata.FailedKeys)
 			require.Len(t, response.Metadata.FailedReasons, 2)
 			require.Contains(t, response.Metadata.FailedReasons[2], "error class: invalid_email")
@@ -1324,7 +1285,6 @@ func TestUploadPartialFailureAcceptance(t *testing.T) {
 			// which an unattributable row must never be allowed to fail.
 			require.Equal(t, []int64{1, 3, 5}, response.Metadata.SucceededKeys)
 
-			// One import, both outcomes, and every importing job accounted for exactly once.
 			require.NotEmpty(t, response.Metadata.FailedKeys)
 			require.NotEmpty(t, response.Metadata.SucceededKeys)
 			require.Len(t, append(append([]int64{}, response.Metadata.FailedKeys...),
@@ -1339,8 +1299,6 @@ func TestUploadPartialFailureAcceptance(t *testing.T) {
 			require.Empty(t, response.Metadata.WarningKeys)
 			require.Empty(t, response.Metadata.WarningReasons)
 
-			// The fixture's rows restate contact emails in their own prose. None of it may reach a
-			// persisted reason.
 			for _, reason := range response.Metadata.FailedReasons {
 				requireCarriesNoContactData(t, reason)
 				require.NotContains(t, reason, "Invalid email address provided")
@@ -1350,24 +1308,20 @@ func TestUploadPartialFailureAcceptance(t *testing.T) {
 	}
 }
 
-// TestReconciliationHandlesUnicodeIdentifiers pins the behaviour of identifier matching for values
-// whose case folding changes their byte length. Case folding is what makes matching robust, but it
-// is also where offset arithmetic over a folded copy of a string goes wrong: U+023A folds to a
-// LONGER encoding and U+212A to a shorter one, so any implementation that indexes the original with
-// offsets taken from the folded copy either panics or mismatches.
+// TestReconciliationHandlesUnicodeIdentifiers covers lowercasing that changes UTF-8 byte length;
+// matching must not reuse offsets from the normalized string against the original. U+023A grows and
+// U+212A shrinks.
 func TestReconciliationHandlesUnicodeIdentifiers(t *testing.T) {
 	t.Parallel()
 
 	const (
-		growingEmail  = "\u023Alex@example.com" // U+023A folds to U+2C65: 2 bytes become 3
+		growingEmail  = "\u023Alex@example.com" // U+023A lowercases to U+2C65: two bytes become three.
 		shrinkingKelv = "\u212Aelvin@example.com"
-		dottedEmail   = "\u0130rem@example.com" // U+0130 folds to two runes
+		dottedEmail   = "\u0130rem@example.com" // U+0130 lowercases to ASCII 'i' (two UTF-8 bytes become one).
 		shortEmail    = "\u023A@e.co"
 	)
 
 	apiService := newAPIServiceMock(t)
-	// Every row names its contact in a different case from the event that produced it, so matching
-	// has to fold both sides rather than compare bytes.
 	apiService.EXPECT().GetImportErrors(testErrorsURL).Times(1).Return([]byte(
 		`[{"email":"`+growingEmail+`","message":"invalid email address"},`+
 			`{"email":"kelvin@example.com","message":"invalid phone number"},`+
@@ -1404,10 +1358,8 @@ func TestReconciliationHandlesUnicodeIdentifiers(t *testing.T) {
 	}
 }
 
-// TestPersistedReasonsCarryNoProviderTextOrContactData is the standing regression for the one
-// property every reason this connector reports has to hold: a reason is written into JobsDB, where
-// it outlives the delivery attempt by far, so it may carry neither third-party prose nor contact
-// data - whatever the provider chose to put in its own messages.
+// TestPersistedReasonsCarryNoProviderTextOrContactData verifies that JobsDB-persisted reasons contain
+// neither provider prose nor contact data.
 func TestPersistedReasonsCarryNoProviderTextOrContactData(t *testing.T) {
 	t.Parallel()
 
