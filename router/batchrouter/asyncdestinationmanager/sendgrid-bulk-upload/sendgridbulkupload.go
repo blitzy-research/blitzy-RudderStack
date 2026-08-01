@@ -114,6 +114,7 @@ const (
 	reasonContactTooLarge      = "the contact is larger than one sendgrid marketing contacts request can carry"
 
 	reasonStagingFileUnreadable   = "the staging file for this batch could not be read; the affected jobs will be retried"
+	reasonJobNotStaged            = "this job was not present in the staging file for its batch, so no contact could be built for it; the affected jobs will be retried"
 	reasonContactUnserializable   = "the contact could not be serialized for sendgrid; the affected jobs will be retried"
 	reasonEnvelopeTooLarge        = "the destination's sendgrid list identifiers alone exceed one request's byte budget, so no contact fits; the affected jobs will be retried once the destination is reconfigured"
 	reasonUploadNotPlanned        = "the sendgrid marketing contacts upsert could not be prepared; the affected jobs will be retried"
@@ -841,6 +842,10 @@ type uploadOutcome struct {
 	failedReasons    []string
 	abortedJobIDs    []int64
 	abortReasons     []string
+	// batchJobIDs is every job the batch router claims for this upload. It is the reference the
+	// completeness sweep in uploadOutput measures the three outcome sets against, so it has to be
+	// set on every path that produces an outcome.
+	batchJobIDs []int64
 }
 
 // Upload sends one request's worth of contacts to SendGrid and reports what happened to every job in
@@ -859,11 +864,13 @@ func (b *SendGridBulkUploader) Upload(asyncDestStruct *common.AsyncDestinationSt
 	if err != nil {
 		b.log().Errorn("[sendgrid bulk upload] the staging file for this batch could not be read", obskit.Error(err))
 		return b.uploadOutput(destinationID, statLabels, uploadOutcome{
+			batchJobIDs:   asyncDestStruct.ImportingJobIDs,
 			failedJobIDs:  asyncDestStruct.ImportingJobIDs,
 			failedReasons: []string{reasonStagingFileUnreadable},
 		})
 	}
 	outcome := uploadOutcome{
+		batchJobIDs:   asyncDestStruct.ImportingJobIDs,
 		failedJobIDs:  staged.failedJobIDs,
 		failedReasons: staged.failedReasons,
 		abortedJobIDs: staged.abortedJobIDs,
@@ -975,6 +982,22 @@ func (b *SendGridBulkUploader) uploadOutput(destinationID string, statLabels sta
 	importing := lo.Uniq(outcome.importingJobIDs)
 	failed, _ := lo.Difference(lo.Uniq(outcome.failedJobIDs), importing)
 	aborted, _ := lo.Difference(lo.Uniq(outcome.abortedJobIDs), append(slices.Clone(importing), failed...))
+
+	// Completeness sweep. The batch router writes a status ONLY for the jobs this output names, so a
+	// job of the batch that landed in none of the three sets would receive no status at all and stay
+	// unresolved - invisibly, because nothing ever failed. The router builds the batch from the very
+	// lines it wrote, so the two should always agree; the sweep is here for when they do not, which
+	// is what a truncated or partially written staging file looks like. Such a job is RETRYABLE and
+	// never aborted, because a line missing from the file says nothing permanent about the job that
+	// produced it, and it is disjoint from the other sets by construction.
+	settled := append(append(slices.Clone(importing), failed...), aborted...)
+	if unaccounted, _ := lo.Difference(lo.Uniq(outcome.batchJobIDs), settled); len(unaccounted) > 0 {
+		b.log().Errorn("[sendgrid bulk upload] jobs in this batch were not present in the staging file",
+			logger.NewIntField("unaccountedJobCount", int64(len(unaccounted))))
+		b.metrics().NewTaggedStat("sendgrid_unaccounted_job_count", stats.CountType, statLabels).Count(len(unaccounted))
+		failed = append(failed, unaccounted...)
+		outcome.failedReasons = appendUniqueReason(outcome.failedReasons, reasonJobNotStaged)
+	}
 
 	if len(importing) > 0 {
 		b.metrics().NewTaggedStat("sendgrid_importing_job_count", stats.CountType, statLabels).Count(len(importing))

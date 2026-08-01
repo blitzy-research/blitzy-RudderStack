@@ -1773,3 +1773,251 @@ func TestImportingParametersCarryTheProviderJobIDUnchanged(t *testing.T) {
 	})
 	require.Equal(t, common.PollStatusResponse{StatusCode: http.StatusOK, Complete: true}, poll)
 }
+
+// TestUploadAccountsForEveryJobInTheBatch pins the completeness sweep.
+//
+// The batch router writes a job status ONLY for the jobs an upload's output names, so a job that
+// landed in none of the three outcome sets receives no status at all and is left unresolved -
+// invisibly, because nothing ever failed. The router builds the batch from the very lines it wrote,
+// so the two should always agree; the sweep exists for when they do not, which is exactly what a
+// truncated or partially written staging file looks like.
+//
+// The missing job is RETRYABLE, never aborted: a line that is not in the file says nothing permanent
+// about the job that produced it, and a later batch either uploads it or fails it with a reason.
+func TestUploadAccountsForEveryJobInTheBatch(t *testing.T) {
+	t.Parallel()
+
+	apiService := newAPIServiceMock(t)
+	apiService.EXPECT().UploadContacts(gomock.Any()).Times(1).
+		DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+			require.Len(t, request.Contacts, 2, "only the staged contacts can be uploaded")
+			return &sendgridbulkupload.UpsertResponse{JobID: testImportJobID}, nil
+		})
+
+	// The batch claims three jobs; the staging file holds two of them.
+	staging := writeStagingFile(t,
+		stagedLine(81, `{"type":"identify","userId":"user_81","traits":{"email":"staged.one@example.com"}}`),
+		stagedLine(82, `{"type":"identify","userId":"user_82","traits":{"email":"staged.two@example.com"}}`),
+	)
+	uploader := newUploader(t, apiService, testEventListID)
+	output := uploader.Upload(asyncDestination(staging, []int64{81, 82, 83}))
+
+	require.Equal(t, []int64{81, 82}, output.ImportingJobIDs)
+	require.Equal(t, []int64{83}, output.FailedJobIDs,
+		"a job the staging file never carried must be reported, not dropped")
+	require.Equal(t, 1, output.FailedCount)
+	require.Contains(t, output.FailedReason, "not present in the staging file")
+	require.Empty(t, output.AbortJobIDs, "nothing permanent has been decided about the missing job")
+
+	// The accepted chunk keeps its own importing state, so the sweep costs the staged contacts
+	// nothing and importCount still describes only the jobs the import actually covers.
+	require.EqualValues(t, 2, gjson.GetBytes(output.ImportingParameters, "importCount").Int())
+
+	// Settled exactly once, and nothing outside the batch settled at all: that is the guarantee the
+	// router depends on, and it is what makes the sweep an invariant rather than a log line.
+	settledCount := make(map[int64]int, 3)
+	for _, jobIDs := range [][]int64{output.ImportingJobIDs, output.FailedJobIDs, output.AbortJobIDs} {
+		for _, jobID := range jobIDs {
+			settledCount[jobID]++
+		}
+	}
+	require.Equal(t, map[int64]int{81: 1, 82: 1, 83: 1}, settledCount)
+	requireCarriesNoContactData(t, output.FailedReason)
+}
+
+// TestJobSideIdentifierCaseNormalization pins identifier case handling on the JOB side of
+// reconciliation, which is where a regression would be silent and expensive.
+//
+// Two distinct normalisation sites exist and they behave differently on purpose. buildContact
+// lower-cases ONLY Contact.Email, because that is the field SendGrid itself lower-cases; external_id,
+// anonymous_id and phone_number_id are sent exactly as the event carried them, because they are
+// opaque customer identifiers that the provider matches verbatim. reconciliationKey then lower-cases
+// BOTH sides when an errors-document row is attributed to a job, so a difference in case can never
+// split a match for any of the four identifiers.
+//
+// Without an assertion from the job side, losing that lower-casing would report contacts SendGrid
+// actually rejected as delivered - the errored row would simply fail to attribute, and the job would
+// succeed by exclusion.
+func TestJobSideIdentifierCaseNormalization(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the wire lower-cases the email and leaves the external id verbatim", func(t *testing.T) {
+		t.Parallel()
+		apiService := newAPIServiceMock(t)
+		var captured sendgridbulkupload.UpsertRequest
+		apiService.EXPECT().UploadContacts(gomock.Any()).Times(1).
+			DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				captured = request
+				return &sendgridbulkupload.UpsertResponse{JobID: testImportJobID}, nil
+			})
+
+		staging := writeStagingFile(t, stagedLine(91,
+			`{"type":"identify","userId":"User_MixedCase","anonymousId":"Anon_MixedCase",`+
+				`"traits":{"email":"Mixed.Case@Example.COM"}}`))
+		uploader := newUploader(t, apiService, testEventListID)
+		output := uploader.Upload(asyncDestination(staging, []int64{91}))
+
+		require.Equal(t, []int64{91}, output.ImportingJobIDs)
+		require.Len(t, captured.Contacts, 1)
+		require.Equal(t, "mixed.case@example.com", captured.Contacts[0].Email)
+		require.Equal(t, "User_MixedCase", captured.Contacts[0].ExternalID)
+		require.Equal(t, "Anon_MixedCase", captured.Contacts[0].AnonymousID)
+	})
+
+	t.Run("a lower-cased row still resolves to its mixed-case staged job", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name string
+			row  string
+		}{
+			{
+				// SendGrid lower-cases the email field itself, so this is the shape a real errors
+				// document takes for a contact staged in mixed case.
+				name: "keyed by email",
+				row:  `{"email":"mixed.case@example.com","message":"invalid email address"}`,
+			},
+			{
+				// external_id is sent verbatim, so only the reconciliation key can bridge a case
+				// difference here - which is exactly why this case exists alongside the email one.
+				name: "keyed by external id",
+				row:  `{"external_id":"user_mixedcase","message":"invalid email address"}`,
+			},
+		}
+		for _, testCase := range cases {
+			t.Run(testCase.name, func(t *testing.T) {
+				t.Parallel()
+				apiService := newAPIServiceMock(t)
+				apiService.EXPECT().GetImportErrors(testErrorsURL).Times(1).
+					Return([]byte(`[`+testCase.row+`]`), nil)
+
+				uploader := newUploader(t, apiService, testEventListID)
+				response := uploader.GetUploadStats(common.GetUploadStatsInput{
+					FailedJobParameters: testErrorsURL,
+					Parameters:          importingParameters(t),
+					ImportingList: []*jobsdb.JobT{
+						importingJob(91, `{"type":"identify","userId":"User_MixedCase","traits":{"email":"Mixed.Case@Example.COM"}}`),
+						importingJob(92, `{"type":"identify","userId":"User_Other","traits":{"email":"Other.Case@Example.COM"}}`),
+					},
+				})
+
+				require.Equal(t, http.StatusOK, response.StatusCode)
+				require.Equal(t, []int64{91}, response.Metadata.FailedKeys)
+				require.Equal(t, []int64{92}, response.Metadata.SucceededKeys)
+				require.NotEmpty(t, response.Metadata.FailedReasons[91])
+				require.Empty(t, response.Metadata.AbortedKeys)
+				requireCarriesNoContactData(t, response.Metadata.FailedReasons[91])
+			})
+		}
+	})
+}
+
+// TestUploadHonoursTheDocumentedContactCeiling anchors the chunker to the literal ceiling SendGrid
+// documents for a single upsert - 30,000 contacts - rather than only to relative splitting.
+//
+// Both readings of the cap are pinned, because they fail differently: the SHIPPED DEFAULT is what
+// production actually uses, while an OVERRIDE ABOVE THE CEILING must be clamped rather than obeyed,
+// since obeying it would have the provider reject the whole request.
+func TestUploadHonoursTheDocumentedContactCeiling(t *testing.T) {
+	t.Parallel()
+
+	const documentedContactCeiling = 30000
+
+	// One contact more than a single request may carry, so the split is observable at the exact
+	// boundary. Each record is deliberately small, so the contact count is the binding cap rather
+	// than the byte budget.
+	lines := make([]string, 0, documentedContactCeiling+1)
+	for jobID := 1; jobID <= documentedContactCeiling+1; jobID++ {
+		lines = append(lines, stagedLine(int64(jobID), fmt.Sprintf(
+			`{"type":"identify","userId":"u%d","traits":{"email":"c%d@example.com"}}`, jobID, jobID)))
+	}
+	staging := writeStagingFile(t, lines...)
+
+	cases := []struct {
+		name        string
+		maxContacts int
+	}{
+		{name: "under the shipped default", maxContacts: 0},
+		{name: "under an override above the ceiling", maxContacts: documentedContactCeiling + 10000},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			apiService := newAPIServiceMock(t)
+			var captured sendgridbulkupload.UpsertRequest
+			apiService.EXPECT().UploadContacts(gomock.Any()).Times(1).
+				DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+					captured = request
+					return &sendgridbulkupload.UpsertResponse{JobID: testImportJobID}, nil
+				})
+
+			uploader := newUploader(t, apiService, testEventListID)
+			uploader.MaxContactsPerRequest = testCase.maxContacts
+			output := uploader.Upload(asyncDestination(staging, func() []int64 {
+				jobIDs := make([]int64, 0, documentedContactCeiling+1)
+				for jobID := 1; jobID <= documentedContactCeiling+1; jobID++ {
+					jobIDs = append(jobIDs, int64(jobID))
+				}
+				return jobIDs
+			}()))
+
+			require.Len(t, captured.Contacts, documentedContactCeiling,
+				"one request carries exactly the documented ceiling, never more")
+			require.Len(t, output.ImportingJobIDs, documentedContactCeiling)
+			// The one contact that did not fit is deferred retryably, so nothing is lost to the cap.
+			require.Equal(t, []int64{documentedContactCeiling + 1}, output.FailedJobIDs)
+			require.Empty(t, output.AbortJobIDs)
+			require.Contains(t, output.FailedReason, "deferred to a later upload")
+		})
+	}
+}
+
+// TestUploadListIDTypeDiscrimination pins the negative half of per-event list targeting.
+//
+// context.externalId is a shared array carrying every kind of external identifier a source may send,
+// so the only thing that makes an entry list targeting is its "type". Without a negative case, a
+// guard that accepted ANY entry would pass every positive test while quietly upserting contacts into
+// whichever list an unrelated identifier happened to name.
+func TestUploadListIDTypeDiscrimination(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name            string
+		externalID      string
+		expectedListIDs []string
+	}{
+		{
+			name:            "an unrelated external id type alone falls back to the destination configuration",
+			externalID:      `[{"type":"brazeExternalId","id":"` + testEventListID + `"}]`,
+			expectedListIDs: []string{testConfigListID},
+		},
+		{
+			name: "an unrelated external id type beside real list targeting is skipped",
+			externalID: `[{"type":"brazeExternalId","id":"not-a-list"},` +
+				`{"type":"listIds","id":["` + testEventListID + `"]}]`,
+			expectedListIDs: []string{testEventListID},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			apiService := newAPIServiceMock(t)
+			var captured sendgridbulkupload.UpsertRequest
+			apiService.EXPECT().UploadContacts(gomock.Any()).Times(1).
+				DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+					captured = request
+					return &sendgridbulkupload.UpsertResponse{JobID: testImportJobID}, nil
+				})
+
+			staging := writeStagingFile(t, stagedLine(101,
+				`{"type":"identify","userId":"user_101","traits":{"email":"targeted@example.com"},`+
+					`"context":{"externalId":`+testCase.externalID+`}}`))
+			uploader := newUploader(t, apiService, testConfigListID)
+			output := uploader.Upload(asyncDestination(staging, []int64{101}))
+
+			require.Equal(t, []int64{101}, output.ImportingJobIDs)
+			require.Equal(t, testCase.expectedListIDs, captured.ListIDs)
+			require.Empty(t, output.FailedJobIDs)
+			require.Empty(t, output.AbortJobIDs)
+		})
+	}
+}
