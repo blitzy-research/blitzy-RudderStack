@@ -1,0 +1,18 @@
+{
+  "errors": [
+    {
+      "message": "Invalid email address provided for contact.",
+      "email": "blake@example.com"
+    },
+    {
+      "error_message": "Contact rejected: custom field value exceeds the maximum allowed length.",
+      "contact": {
+        "email": "devon@example.com"
+      }
+    },
+    {
+      "reason": "Contact could not be processed: no matching contact record.",
+      "email": "ghost@example.com"
+    }
+  ]
+}
