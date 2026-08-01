@@ -165,6 +165,32 @@ type RateLimitError struct {
 	Remaining int64
 }
 
+const (
+	// maxRenderableResetEpoch is 9999-12-31T23:59:59Z in UNIX seconds, the latest instant RFC 3339
+	// can express. It is compared against the raw header value rather than against the instant it
+	// converts to, because converting an absurd epoch overflows before it can be range-checked.
+	maxRenderableResetEpoch = 253402300799
+
+	// resetOutOfRange is what a rate limit reset outside that range renders as. A fixed token rather
+	// than the number itself, so an absurd header value cannot lengthen a persisted reason either.
+	resetOutOfRange = "out-of-range"
+)
+
+// resetWindow renders X-RateLimit-Reset as an absolute UTC instant, or reports it as out of range.
+//
+// The header is provider-controlled and unvalidated, and RFC 3339 expresses a four-digit year, so a
+// value beyond that range is not a renderable timestamp at all: Go's formatter silently emits a
+// twelve-digit year instead, which is how X-RateLimit-Reset: 9223372036854775807 came to read as
+// "292277026596-12-04T15:30:07Z" in an operator-facing reason. Such a value is reported as out of
+// range rather than clamped to the boundary, because clamping would state a reset time the provider
+// never published. Every value that IS renderable is rendered exactly as the provider sent it.
+func (e *RateLimitError) resetWindow() string {
+	if e.ResetEpoch > maxRenderableResetEpoch {
+		return resetOutOfRange
+	}
+	return time.Unix(e.ResetEpoch, 0).UTC().Format(time.RFC3339)
+}
+
 func (e *RateLimitError) Error() string {
 	details := make([]string, 0, 4)
 	if e.RetryAfter != "" {
@@ -173,7 +199,7 @@ func (e *RateLimitError) Error() string {
 	if e.ResetEpoch > 0 {
 		// Rendered as an absolute UTC instant: the header is epoch seconds, not a delta, and an
 		// absolute timestamp stays meaningful however long the reason survives in JobsDB.
-		details = append(details, "reset="+time.Unix(e.ResetEpoch, 0).UTC().Format(time.RFC3339))
+		details = append(details, "reset="+e.resetWindow())
 	}
 	if e.Limit >= 0 {
 		details = append(details, fmt.Sprintf("limit=%d", e.Limit))

@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -641,15 +642,34 @@ func parseStagingLine(line []byte) (int64, gjson.Result, error) {
 		return 0, gjson.Result{}, errUnattributableStagedLine
 	}
 	staged := gjson.ParseBytes(line)
-	jobID := staged.Get("metadata.job_id")
-	if jobID.Type != gjson.Number || jobID.Int() <= 0 {
+	jobID, attributable := stagedJobID(staged.Get("metadata.job_id"))
+	if !attributable {
 		return 0, gjson.Result{}, errUnattributableStagedLine
 	}
 	message := staged.Get("message")
 	if !message.IsObject() {
-		return jobID.Int(), gjson.Result{}, errMalformedStagedEvent
+		return jobID, gjson.Result{}, errMalformedStagedEvent
 	}
-	return jobID.Int(), message, nil
+	return jobID, message, nil
+}
+
+// stagedJobID reads a staged line's job ID, accepting only a positive JSON integer that a jobsdb job
+// ID can actually hold.
+//
+// The raw token is parsed rather than gjson's numeric view, because that view is lossy in exactly the
+// direction that matters: it truncates a fractional value (1.5 becomes 1) and saturates one too large
+// for an int64. Either would name a job that is not in this batch while leaving the real one
+// unaccounted for, so such a line is treated as unattributable - which fails the batch retryably -
+// rather than being silently re-pointed at some other job.
+func stagedJobID(value gjson.Result) (int64, bool) {
+	if value.Type != gjson.Number {
+		return 0, false
+	}
+	jobID, err := strconv.ParseInt(strings.TrimSpace(value.Raw), 10, 64)
+	if err != nil || jobID <= 0 {
+		return 0, false
+	}
+	return jobID, true
 }
 
 // readStagedContacts isolates attributable record errors; file/scan failures and lines without a job
@@ -792,11 +812,25 @@ func requestEnvelopeBytes(listIDs []string) (int, error) {
 	return len(envelope), nil
 }
 
+// contactSeparatorBytes is the one byte the serialized contacts array spends on the comma between two
+// adjacent contacts. An array of N contacts carries exactly N-1 of them, which is why the cost is
+// charged from the SECOND contact of a chunk onward and never for the first.
+const contactSeparatorBytes = 1
+
 // chunkBySizeAndElements packs contacts into chunks that respect both caps, returning index-aligned
 // contact and jobID chunks so a single request's jobs can always be named exactly.
 //
+// The byte accounting is EXACT rather than conservative, and deliberately so. maxBytes is the request
+// cap minus the measured envelope, so it is precisely how many bytes may sit between the brackets of
+// "contacts":[…]; a chunk of N contacts occupies sum(sizes) + (N-1) of them. Over-charging a
+// separator for the first contact, or flushing when the projected size merely REACHES the budget,
+// would shave two bytes off every request and - worse - make a lone contact measuring exactly the
+// budget look impossible to send, which is a terminal verdict on a job the provider would have
+// accepted. Both comparisons are therefore strict and count only bytes the body actually spends.
+//
 // A contact too large for any chunk is isolated rather than allowed to wedge the loop, and its jobID
-// is retained so the record is accounted for instead of silently disappearing.
+// is retained so the record is accounted for instead of silently disappearing. That test uses the
+// contact's bare size, because a chunk of one carries no separator.
 func chunkBySizeAndElements(contacts []Contact, jobIDs []int64, sizes []int, maxBytes, maxElements int) ([][]Contact, [][]int64, []int64) {
 	var (
 		contactChunks [][]Contact
@@ -817,19 +851,24 @@ func chunkBySizeAndElements(contacts []Contact, jobIDs []int64, sizes []int, max
 		chunkSize = 0
 	}
 	for index := range contacts {
-		// Reserve one separator byte per contact; the first contact in each chunk is conservatively
-		// over-counted by one byte.
-		contactSize := sizes[index] + 1
-		if contactSize > maxBytes {
+		size := sizes[index]
+		if size > maxBytes {
 			oversized = append(oversized, jobIDs[index])
 			continue
 		}
-		if chunkSize+contactSize >= maxBytes || len(chunkContacts) == maxElements {
+		projected := chunkSize + size
+		if len(chunkContacts) > 0 {
+			projected += contactSeparatorBytes
+		}
+		if projected > maxBytes || len(chunkContacts) == maxElements {
 			flush()
+			// The contact now opens a fresh chunk, so it pays no separator. It is known to fit,
+			// because a contact larger than the whole budget was isolated above.
+			projected = size
 		}
 		chunkContacts = append(chunkContacts, contacts[index])
 		chunkJobIDs = append(chunkJobIDs, jobIDs[index])
-		chunkSize += contactSize
+		chunkSize = projected
 	}
 	flush()
 	return contactChunks, jobIDChunks, oversized

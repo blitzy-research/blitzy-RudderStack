@@ -3,6 +3,7 @@ package sendgridbulkupload_test
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -501,6 +502,222 @@ func TestUploadRateLimited(t *testing.T) {
 	requireCarriesNoContactData(t, output.FailedReason)
 }
 
+// TestRateLimitReasonRendersOnlyARenderableResetWindow pins how X-RateLimit-Reset reaches an operator.
+//
+// The header is provider-controlled and unvalidated, and it lands in a JobsDB failure reason that long
+// outlives the delivery attempt. RFC 3339 expresses a four-digit year, so an epoch beyond that range is
+// not a timestamp at all - Go's formatter silently emits a twelve-digit year - and presenting that as
+// the moment a rate limit lifts is noise dressed up as a fact. Every value that IS renderable must
+// still be rendered exactly as the provider sent it, so both halves are asserted.
+func TestRateLimitReasonRendersOnlyARenderableResetWindow(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		resetEpoch    int64
+		expectedReset string
+		renderable    bool
+	}{
+		{
+			name: "a window seconds away is rendered exactly", resetEpoch: 1893456000,
+			expectedReset: "2030-01-01T00:00:00Z", renderable: true,
+		},
+		{
+			// The latest instant RFC 3339 can express: still rendered, because it still is a timestamp.
+			name: "the last renderable instant is still rendered", resetEpoch: 253402300799,
+			expectedReset: "9999-12-31T23:59:59Z", renderable: true,
+		},
+		{
+			name:       "one second past the last renderable instant is reported out of range",
+			resetEpoch: 253402300800, expectedReset: "out-of-range",
+		},
+		{
+			name: "an absurd header value is reported out of range", resetEpoch: math.MaxInt64,
+			expectedReset: "out-of-range",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			reason := (&sendgridbulkupload.RateLimitError{
+				StatusCode: http.StatusTooManyRequests,
+				ResetEpoch: testCase.resetEpoch,
+				Limit:      600,
+				Remaining:  0,
+			}).Error()
+
+			require.Contains(t, reason, "reset="+testCase.expectedReset)
+			require.NotContains(t, reason, strconv.FormatInt(testCase.resetEpoch, 10),
+				"the raw header value is never repeated back")
+			require.Contains(t, reason, "limit=600", "an unusable window must not cost the usable fields")
+			require.Contains(t, reason, "remaining=0")
+			if testCase.renderable {
+				parsed, err := time.Parse(time.RFC3339, testCase.expectedReset)
+				require.NoError(t, err, "a rendered window must be valid RFC 3339")
+				require.Equal(t, testCase.resetEpoch, parsed.Unix())
+			}
+		})
+	}
+}
+
+// TestStagingLineJobIDMustBeAnExactInteger pins which staged lines may name a job.
+//
+// A staged line's metadata.job_id is the only link between a contact and the job that produced it, and
+// the numeric view of a JSON value is lossy in exactly the wrong direction: it truncates a fractional
+// value and saturates one too large for an int64. Either would report a job that is not in this batch
+// while leaving the real one unaccounted for. Such a line must therefore be unattributable - which
+// defers the batch retryably - rather than being silently re-pointed at some other job.
+func TestStagingLineJobIDMustBeAnExactInteger(t *testing.T) {
+	t.Parallel()
+
+	const event = `{"type":"identify","userId":"user_1","traits":{"email":"exact@example.com"}}`
+
+	t.Run("a job id that is not an exact int64 makes the line unattributable", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name  string
+			jobID string
+		}{
+			{name: "a fractional value", jobID: "1.5"},
+			{name: "a value larger than an int64", jobID: "99999999999999999999"},
+			{name: "an exponent form", jobID: "1e3"},
+			{name: "zero", jobID: "0"},
+			{name: "a negative value", jobID: "-1"},
+		}
+		for _, testCase := range cases {
+			t.Run(testCase.name, func(t *testing.T) {
+				t.Parallel()
+				apiService := newAPIServiceMock(t)
+				apiService.EXPECT().UploadContacts(gomock.Any()).Times(0)
+
+				staging := writeStagingFile(t,
+					`{"message":`+event+`,"metadata":{"job_id":`+testCase.jobID+`}}`)
+				uploader := newUploader(t, apiService, testEventListID)
+				output := uploader.Upload(asyncDestination(staging, []int64{1}))
+
+				// The batch is deferred as a whole, and only the jobs the router actually claimed are
+				// ever named - never a job ID conjured out of a malformed value.
+				require.Equal(t, []int64{1}, output.FailedJobIDs)
+				require.Contains(t, output.FailedReason, "staging file for this batch could not be read")
+				require.Empty(t, output.ImportingJobIDs)
+				require.Nil(t, output.ImportingParameters)
+				require.Empty(t, output.AbortJobIDs)
+			})
+		}
+	})
+
+	t.Run("an exact integer job id is accepted", func(t *testing.T) {
+		t.Parallel()
+		apiService := newAPIServiceMock(t)
+		apiService.EXPECT().UploadContacts(gomock.Any()).Times(1).
+			Return(&sendgridbulkupload.UpsertResponse{JobID: testImportJobID}, nil)
+
+		staging := writeStagingFile(t, stagedLine(7, event))
+		uploader := newUploader(t, apiService, testEventListID)
+		output := uploader.Upload(asyncDestination(staging, []int64{7}))
+
+		require.Equal(t, []int64{7}, output.ImportingJobIDs)
+		require.Empty(t, output.FailedJobIDs)
+		require.Empty(t, output.AbortJobIDs)
+	})
+}
+
+// TestListIDCountIsBoundedBeforeDeduplication pins the documented bound on how many list identifiers
+// one upsert will target, and the order in which it is applied.
+//
+// The count is checked on the RAW set, before duplicates are collapsed, which is the DoS-safer
+// ordering: an event naming an unbounded number of repeats is refused before anything is allocated or
+// normalised. That is a deliberate choice rather than an accident, so both halves are pinned - repeats
+// within the bound still collapse to the distinct set, and a raw count over the bound is refused with
+// this connector's own reason and no partial delivery.
+func TestListIDCountIsBoundedBeforeDeduplication(t *testing.T) {
+	t.Parallel()
+
+	const maxListIDs = 64
+	repeatedListIDs := func(count int, ids ...string) []string {
+		listIDs := make([]string, 0, count)
+		for len(listIDs) < count-len(ids) {
+			listIDs = append(listIDs, testEventListID)
+		}
+		return append(listIDs, ids...)
+	}
+	asJSONArray := func(listIDs []string) string {
+		encoded, err := jsonrs.Marshal(listIDs)
+		require.NoError(t, err)
+		return string(encoded)
+	}
+
+	t.Run("the destination configuration collapses repeats within the bound", func(t *testing.T) {
+		t.Parallel()
+		manager, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP, &backendconfig.DestinationT{
+			ID: testDestinationID,
+			Config: map[string]any{
+				"apiKey":  testAPIKey,
+				"listIds": repeatedListIDs(maxListIDs, testConfigListID),
+			},
+		})
+		require.NoError(t, err)
+		require.Equal(t, []string{testEventListID, testConfigListID}, manager.DestinationConfig.ListIDs,
+			"64 raw identifiers naming 2 distinct lists are accepted and collapsed")
+	})
+
+	t.Run("the destination configuration is refused past the bound", func(t *testing.T) {
+		t.Parallel()
+		manager, err := sendgridbulkupload.NewManager(logger.NOP, stats.NOP, &backendconfig.DestinationT{
+			ID: testDestinationID,
+			Config: map[string]any{
+				"apiKey":  testAPIKey,
+				"listIds": repeatedListIDs(maxListIDs+1, testConfigListID),
+			},
+		})
+		require.Error(t, err)
+		require.Nil(t, manager, "never a partially initialised manager")
+	})
+
+	t.Run("a per-event target collapses repeats within the bound", func(t *testing.T) {
+		t.Parallel()
+		apiService := newAPIServiceMock(t)
+		var captured sendgridbulkupload.UpsertRequest
+		apiService.EXPECT().UploadContacts(gomock.Any()).Times(1).
+			DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+				captured = request
+				return &sendgridbulkupload.UpsertResponse{JobID: testImportJobID}, nil
+			})
+
+		staging := writeStagingFile(t, stagedLine(111,
+			`{"type":"identify","userId":"user_111","traits":{"email":"bounded@example.com"},`+
+				`"context":{"externalId":[{"type":"listIds","id":`+
+				asJSONArray(repeatedListIDs(maxListIDs, testConfigListID))+`}]}}`))
+		uploader := newUploader(t, apiService, testEventListID)
+		output := uploader.Upload(asyncDestination(staging, []int64{111}))
+
+		require.Equal(t, []int64{111}, output.ImportingJobIDs)
+		require.Equal(t, []string{testEventListID, testConfigListID}, captured.ListIDs)
+	})
+
+	t.Run("a per-event target past the bound is refused terminally, never partially delivered", func(t *testing.T) {
+		t.Parallel()
+		apiService := newAPIServiceMock(t)
+		apiService.EXPECT().UploadContacts(gomock.Any()).Times(0)
+
+		staging := writeStagingFile(t, stagedLine(112,
+			`{"type":"identify","userId":"user_112","traits":{"email":"unbounded@example.com"},`+
+				`"context":{"externalId":[{"type":"listIds","id":`+
+				asJSONArray(repeatedListIDs(maxListIDs+1, testConfigListID))+`}]}}`))
+		uploader := newUploader(t, apiService, testEventListID)
+		output := uploader.Upload(asyncDestination(staging, []int64{112}))
+
+		// Terminal by design: the same event would be refused identically on every retry, and the
+		// alternative - dropping the lists that did not fit - would present a subset delivery as
+		// complete.
+		require.Equal(t, []int64{112}, output.AbortJobIDs)
+		require.Contains(t, output.AbortReason, "more sendgrid lists, or longer list identifiers, than this connector will send")
+		require.Empty(t, output.ImportingJobIDs)
+		require.Empty(t, output.FailedJobIDs)
+		requireCarriesNoContactData(t, output.AbortReason)
+	})
+}
+
 func TestUploadRejectionsAndFailures(t *testing.T) {
 	t.Parallel()
 
@@ -824,6 +1041,262 @@ func nilIfEmpty(jobIDs []int64) []int64 {
 		return nil
 	}
 	return jobIDs
+}
+
+// requestEnvelopeSize is the fixed cost of one upsert body that is not a contact: the list IDs and
+// the surrounding object, with an empty contacts array. It mirrors what the connector measures, and
+// it is what turns a configured cap into the number of bytes the contacts themselves may occupy.
+func requestEnvelopeSize(t *testing.T, listIDs ...string) int {
+	t.Helper()
+	envelope, err := jsonrs.Marshal(sendgridbulkupload.UpsertRequest{
+		ListIDs:  listIDs,
+		Contacts: []sendgridbulkupload.Contact{},
+	})
+	require.NoError(t, err)
+	return len(envelope)
+}
+
+// contactOfSize is the contact stagedContactOfSize' line reduces to: an email plus one mapped
+// custom field, whose padded value is the only variable part of the serialization.
+func contactOfSize(email, pad string) sendgridbulkupload.Contact {
+	return sendgridbulkupload.Contact{Email: email, CustomFields: map[string]any{"w1": pad}}
+}
+
+// stagedContactOfSize stages one event whose contact serializes to EXACTLY size bytes.
+//
+// Byte-cap boundary cases are only meaningful if the body's size is known to the byte, so the size is
+// solved for rather than approximated: everything but the mapped custom field's value is fixed, so the
+// padding length follows directly, and the result is re-measured before being returned.
+func stagedContactOfSize(t *testing.T, jobID int64, size int) string {
+	t.Helper()
+	email := fmt.Sprintf("c%d@example.com", jobID)
+	empty, err := jsonrs.Marshal(contactOfSize(email, ""))
+	require.NoError(t, err)
+	padLength := size - len(empty)
+	require.GreaterOrEqualf(t, padLength, 1, "a contact of %d bytes is smaller than this helper builds", size)
+
+	pad := strings.Repeat("p", padLength)
+	measured, err := jsonrs.Marshal(contactOfSize(email, pad))
+	require.NoError(t, err)
+	require.Len(t, measured, size, "the helper must land on the requested contact size exactly")
+
+	return stagedLine(jobID, fmt.Sprintf(
+		`{"type":"identify","traits":{"email":%q,"plan":%q}}`, email, pad))
+}
+
+// stagedContactsFillingBody stages the contacts whose whole serialized request body - envelope
+// included - measures exactly wholeBody bytes. The bulk records are uniform and a single trailing
+// record absorbs the remainder, so the total lands on the target to the byte.
+func stagedContactsFillingBody(t *testing.T, envelope, wholeBody int) ([]string, []int64) {
+	t.Helper()
+	// A serialized array of N contacts spends sum(sizes) + (N-1) bytes: one separator between each
+	// adjacent pair, and none before the first.
+	const (
+		bulkContactSize = 1024
+		minFinalContact = 128
+	)
+	content := wholeBody - envelope
+	require.Greater(t, content, bulkContactSize+minFinalContact)
+
+	lines := make([]string, 0, content/bulkContactSize+1)
+	jobIDs := make([]int64, 0, content/bulkContactSize+1)
+	spent := 0
+	for jobID := int64(1); ; jobID++ {
+		cost := bulkContactSize
+		if len(lines) > 0 {
+			cost += 1 // separator
+		}
+		// Stop while enough of the budget is left for the trailing record to absorb the remainder.
+		if spent+cost+minFinalContact > content {
+			lines = append(lines, stagedContactOfSize(t, jobID, content-spent-1))
+			jobIDs = append(jobIDs, jobID)
+			return lines, jobIDs
+		}
+		lines = append(lines, stagedContactOfSize(t, jobID, bulkContactSize))
+		jobIDs = append(jobIDs, jobID)
+		spent += cost
+	}
+}
+
+// TestUploadFillsTheByteBudgetToTheLastByte pins the byte cap at its exact boundary, for a lone
+// contact and for a multi-contact request, and against the shipped ceiling rather than only a
+// convenient override.
+//
+// SendGrid charges its ceiling for the WHOLE serialized body, so the only correct reading is that a
+// body measuring the cap fits and a body one byte larger does not. Both directions matter, and they
+// fail differently. Under-filling silently wastes provider capacity and defers jobs that would have
+// shipped. Over-strictness is worse: a lone contact measuring exactly the budget must never be judged
+// impossible to send, because that verdict is TERMINAL for a job SendGrid would have accepted.
+func TestUploadFillsTheByteBudgetToTheLastByte(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a lone contact is judged against the whole budget", func(t *testing.T) {
+		t.Parallel()
+
+		const contactSize = 400
+		envelope := requestEnvelopeSize(t, testEventListID)
+		wholeBody := envelope + contactSize
+
+		cases := []struct {
+			name             string
+			maxRequestBytes  int
+			expectedRequests int
+		}{
+			{name: "one byte short of the body it produces", maxRequestBytes: wholeBody - 1, expectedRequests: 0},
+			{name: "exactly the body it produces", maxRequestBytes: wholeBody, expectedRequests: 1},
+			{name: "one byte more than the body it produces", maxRequestBytes: wholeBody + 1, expectedRequests: 1},
+		}
+		for _, testCase := range cases {
+			t.Run(testCase.name, func(t *testing.T) {
+				t.Parallel()
+				apiService := newAPIServiceMock(t)
+				var captured sendgridbulkupload.UpsertRequest
+				apiService.EXPECT().UploadContacts(gomock.Any()).Times(testCase.expectedRequests).
+					DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+						captured = request
+						return &sendgridbulkupload.UpsertResponse{JobID: testImportJobID}, nil
+					})
+
+				staging := writeStagingFile(t, stagedContactOfSize(t, 1, contactSize))
+				uploader := newUploader(t, apiService, testEventListID)
+				uploader.MaxRequestBytes = testCase.maxRequestBytes
+				output := uploader.Upload(asyncDestination(staging, []int64{1}))
+
+				if testCase.expectedRequests == 0 {
+					// Genuinely impossible, and permanently so: no configuration this connector will
+					// accept could carry it, so the job is refused terminally rather than retried.
+					require.Equal(t, []int64{1}, output.AbortJobIDs)
+					require.Contains(t, output.AbortReason, "larger than one sendgrid marketing contacts request can carry")
+					require.Empty(t, output.ImportingJobIDs)
+					return
+				}
+				body, err := jsonrs.Marshal(captured)
+				require.NoError(t, err)
+				require.Len(t, body, wholeBody, "the body must be the size the contact and envelope imply")
+				require.LessOrEqual(t, len(body), testCase.maxRequestBytes)
+				require.Equal(t, []int64{1}, output.ImportingJobIDs)
+				require.Empty(t, output.AbortJobIDs, "a contact that fits is never a terminal failure")
+				require.Empty(t, output.FailedJobIDs)
+			})
+		}
+	})
+
+	t.Run("one request is filled up to the last byte the cap allows", func(t *testing.T) {
+		t.Parallel()
+
+		const (
+			firstContactSize  = 300
+			secondContactSize = 500
+		)
+		envelope := requestEnvelopeSize(t, testEventListID)
+		// Two contacts cost their sizes plus the single separator between them.
+		wholeBody := envelope + firstContactSize + 1 + secondContactSize
+
+		cases := []struct {
+			name             string
+			maxRequestBytes  int
+			expectedContacts int
+			expectedImports  []int64
+			expectedDeferred []int64
+		}{
+			{
+				name: "two bytes short of both contacts", maxRequestBytes: wholeBody - 2,
+				expectedContacts: 1, expectedImports: []int64{1}, expectedDeferred: []int64{2},
+			},
+			{
+				name: "one byte short of both contacts", maxRequestBytes: wholeBody - 1,
+				expectedContacts: 1, expectedImports: []int64{1}, expectedDeferred: []int64{2},
+			},
+			{
+				name: "exactly both contacts", maxRequestBytes: wholeBody,
+				expectedContacts: 2, expectedImports: []int64{1, 2},
+			},
+			{
+				name: "one byte more than both contacts", maxRequestBytes: wholeBody + 1,
+				expectedContacts: 2, expectedImports: []int64{1, 2},
+			},
+		}
+		for _, testCase := range cases {
+			t.Run(testCase.name, func(t *testing.T) {
+				t.Parallel()
+				apiService := newAPIServiceMock(t)
+				var captured sendgridbulkupload.UpsertRequest
+				apiService.EXPECT().UploadContacts(gomock.Any()).Times(1).
+					DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+						captured = request
+						return &sendgridbulkupload.UpsertResponse{JobID: testImportJobID}, nil
+					})
+
+				staging := writeStagingFile(t,
+					stagedContactOfSize(t, 1, firstContactSize),
+					stagedContactOfSize(t, 2, secondContactSize))
+				uploader := newUploader(t, apiService, testEventListID)
+				uploader.MaxRequestBytes = testCase.maxRequestBytes
+				output := uploader.Upload(asyncDestination(staging, []int64{1, 2}))
+
+				body, err := jsonrs.Marshal(captured)
+				require.NoError(t, err)
+				require.Len(t, captured.Contacts, testCase.expectedContacts)
+				require.LessOrEqualf(t, len(body), testCase.maxRequestBytes,
+					"a %d byte body exceeds the %d byte cap", len(body), testCase.maxRequestBytes)
+				require.Equal(t, testCase.expectedImports, output.ImportingJobIDs)
+				require.Equal(t, testCase.expectedDeferred, nilIfEmpty(output.FailedJobIDs))
+				require.Empty(t, output.AbortJobIDs)
+				if testCase.expectedContacts == 2 {
+					require.Len(t, body, wholeBody, "both contacts fit, so the body is the full size")
+				}
+			})
+		}
+	})
+
+	t.Run("the shipped six-megabyte ceiling is filled exactly", func(t *testing.T) {
+		t.Parallel()
+
+		// The documented ceiling, which is also this connector's default. No override is set, so this
+		// is the budget production actually runs with.
+		const documentedRequestCeiling = 6_000_000
+		envelope := requestEnvelopeSize(t, testEventListID)
+
+		cases := []struct {
+			name      string
+			wholeBody int
+			// deferred is how many trailing jobs cannot travel with the rest.
+			deferred int
+		}{
+			{name: "a body measuring the ceiling travels as one request", wholeBody: documentedRequestCeiling},
+			{name: "a body one byte over the ceiling splits", wholeBody: documentedRequestCeiling + 1, deferred: 1},
+		}
+		for _, testCase := range cases {
+			t.Run(testCase.name, func(t *testing.T) {
+				t.Parallel()
+				apiService := newAPIServiceMock(t)
+				var captured sendgridbulkupload.UpsertRequest
+				apiService.EXPECT().UploadContacts(gomock.Any()).Times(1).
+					DoAndReturn(func(request sendgridbulkupload.UpsertRequest) (*sendgridbulkupload.UpsertResponse, error) {
+						captured = request
+						return &sendgridbulkupload.UpsertResponse{JobID: testImportJobID}, nil
+					})
+
+				lines, jobIDs := stagedContactsFillingBody(t, envelope, testCase.wholeBody)
+				staging := writeStagingFile(t, lines...)
+				uploader := newUploader(t, apiService, testEventListID)
+				output := uploader.Upload(asyncDestination(staging, jobIDs))
+
+				body, err := jsonrs.Marshal(captured)
+				require.NoError(t, err)
+				require.LessOrEqualf(t, len(body), documentedRequestCeiling,
+					"a %d byte body exceeds the documented %d byte ceiling", len(body), documentedRequestCeiling)
+				require.Len(t, captured.Contacts, len(jobIDs)-testCase.deferred)
+				require.Len(t, output.ImportingJobIDs, len(jobIDs)-testCase.deferred)
+				require.Len(t, output.FailedJobIDs, testCase.deferred)
+				require.Empty(t, output.AbortJobIDs, "nothing here is too large to send")
+				if testCase.deferred == 0 {
+					require.Len(t, body, documentedRequestCeiling,
+						"the request must fill the ceiling to the byte, not stop short of it")
+				}
+			})
+		}
+	})
 }
 
 func TestPoll(t *testing.T) {
